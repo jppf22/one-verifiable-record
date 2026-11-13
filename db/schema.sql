@@ -42,7 +42,11 @@ CREATE TABLE chunks (
 ) ENGINE=InnoDB;
 
 -- HNSW index: all retrieval (RAG + merge view) is a single SQL statement.
-CREATE VECTOR INDEX vidx_chunks ON chunks (embedding) USING HNSW (M=8, ef_CONSTRUCT=64);
+-- MariaDB 11.8 requires the indexed VECTOR column to be NOT NULL, and embedding
+-- is NULL until jobs/embed.py runs, so embed.py adds the index after a full
+-- pass over a table:
+--   ALTER TABLE chunks MODIFY embedding VECTOR(1024) NOT NULL;
+--   CREATE VECTOR INDEX vidx_chunks ON chunks (embedding) M=8 DISTANCE=cosine;
 
 -- ----------------------------------------------------------------------------
 -- claims: atomic statements extracted from chunks. The diff unit of the merge
@@ -71,7 +75,10 @@ CREATE TABLE claims (
 ) ENGINE=InnoDB
 WITH SYSTEM VERSIONING;
 
-CREATE VECTOR INDEX vidx_claims ON claims (embedding) USING HNSW (M=8, ef_CONSTRUCT=64);
+-- Same as vidx_chunks: created by jobs/embed.py once no claim lacks an
+-- embedding (CREATE VECTOR INDEX vidx_claims ON claims (embedding)
+-- M=8 DISTANCE=cosine). DISTANCE=cosine matches the VEC_DISTANCE_COSINE
+-- queries in server/, otherwise the index is not used.
 
 -- ----------------------------------------------------------------------------
 -- claim_links: cross-language alignment between two claims + its verdict.

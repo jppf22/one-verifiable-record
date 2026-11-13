@@ -7,8 +7,9 @@ Sources:
 
 The loader walks --data-dir for ``*.jsonl`` files whose records contain at
 least ``lang`` / ``title`` / ``text`` plus optional ``page_id``, ``qid`` (or
-``wikidata_qid``), ``revision_id``, ``section``. If the downloaded dataset
-layout differs, adapt ``iter_records`` — it is deliberately the only
+``wikidata_qid``), ``revision_id``, ``section``, and for the official
+``articles-<lang>.parquet`` files of the MariaDB Wikipedia datasets. If the
+layout differs otherwise, adapt ``iter_records`` — it is deliberately the only
 format-coupled function in the file.
 
 Embeddings are NOT computed here: run ``jobs/embed.py`` afterwards.
@@ -24,6 +25,7 @@ import re
 import sys
 
 import mariadb
+import pyarrow.parquet as pq
 
 TARGET_CHUNK_CHARS = 1200
 SPLIT_RE = re.compile(r"\n\n+")
@@ -61,13 +63,29 @@ def split_chunks(text: str):
 def iter_records(data_dir: str):
     for root, _dirs, files in os.walk(data_dir):
         for fname in sorted(files):
-            if not fname.endswith(".jsonl"):
-                continue
-            with open(os.path.join(root, fname), encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        yield json.loads(line)
+            path = os.path.join(root, fname)
+            if fname.endswith(".jsonl"):
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            yield json.loads(line)
+            elif fname.startswith("articles-") and fname.endswith(".parquet"):
+                # MariaDB Wikipedia datasets (S/M/L releases and the
+                # mariadb-vector-wikipedia-rag starter) ship per-language
+                # parquet: lang, page_id, rev_id, wikidata_id, title, url,
+                # date_modified, text.
+                for batch in pq.ParquetFile(path).iter_batches(batch_size=500):
+                    for rec in batch.to_pylist():
+                        yield {
+                            "lang": rec.get("lang"),
+                            "title": rec.get("title"),
+                            "text": rec.get("text"),
+                            "page_id": rec.get("page_id"),
+                            "qid": rec.get("wikidata_id"),
+                            "revision_id": rec.get("rev_id"),
+                            "section": None,
+                        }
 
 
 def main():
