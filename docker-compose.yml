@@ -1,0 +1,54 @@
+services:
+  mariadb:
+    image: mariadb:11.8
+    container_name: ovr-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-ovr_root}
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-wikipedia}
+      MARIADB_USER: ${MARIADB_USER:-ovr}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-ovr_pass}
+    command:
+      - --max_allowed_packet=256M
+      - --innodb_buffer_pool_size=${INNODB_BUFFER_POOL_SIZE:-2G}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_buffer_pool_size"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  server:
+    build: ./server
+    container_name: ovr-server
+    environment:
+      DATABASE_HOST: mariadb
+      DATABASE_PORT: 3306
+      DATABASE_USER: ${MARIADB_USER:-ovr}
+      DATABASE_PASSWORD: ${MARIADB_PASSWORD:-ovr_pass}
+      DATABASE_NAME: ${MARIADB_DATABASE:-wikipedia}
+      VERDA_API_KEY: ${VERDA_API_KEY:-}
+      VERDA_BASE_URL: ${VERDA_BASE_URL:-https://api.verda.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-kimi-k3.1-pro}
+      EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    container_name: ovr-web
+    depends_on:
+      - server
+    ports:
+      - "127.0.0.1:8080:80"
+    restart: unless-stopped
+
+volumes:
+  mariadb_data:

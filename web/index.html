@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>One Verifiable Record</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>One Verifiable Record</h1>
+    <p class="tagline">Wikipedia editions are branches. This is the merge tool.</p>
+    <form id="search-form">
+      <input id="search-input" placeholder="Search an article tracked across fi / sv / en…" autocomplete="off">
+      <button type="submit">Open merge view</button>
+    </form>
+  </header>
+
+  <main>
+    <section id="article-picker">
+      <p class="muted">Search for an article to see how the Finnish, Swedish and English
+      editions agree, conflict, or leave gaps in each other.</p>
+      <div id="results" class="results"></div>
+    </section>
+
+    <section id="merge-view" hidden>
+      <div id="merge-header"></div>
+      <div id="clusters"></div>
+      <section id="suggestions" hidden></section>
+
+      <section id="qa">
+        <h2>Ask this article</h2>
+        <form id="qa-form">
+          <input id="qa-input" placeholder="e.g. What birth date do the editions give?" autocomplete="off">
+          <button type="submit">Ask</button>
+        </form>
+        <div id="qa-answer"></div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="modal">
+    <div id="modal-body"></div>
+    <button id="modal-close">Close</button>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

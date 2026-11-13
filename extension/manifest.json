@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "One Verifiable Record",
+  "version": "0.1.0",
+  "description": "Cross-language consistency badge for Wikipedia articles. See how the fi/sv/en editions agree or conflict, and jump to the merge view.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://*.wikipedia.org/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.wikipedia.org/wiki/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
