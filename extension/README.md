@@ -17,16 +17,16 @@ are conflicts, amber when there are only gaps, green otherwise.
 
 Click the extension icon:
 
-- **API base URL**: where the FastAPI server runs (default `http://localhost:8000`;
-  the Verda VM address during the demo)
+- **API base URL**: the web app address (default `http://localhost:8080`). Its nginx
+  proxy forwards `/api` internally, so a hosted demo should use
+  `http://<vm-ip>:8080`, not the private FastAPI port.
 - **Web merge view URL**: where the web app runs (default `http://localhost:8080`)
 - **Badge enabled**: toggle the content script off/on without reloading
 
 ## Deployed-origin note
 
-For a hosted API, add its origin to `host_permissions` in `manifest.json` and to
-the server's CORS regex (`server/main.py`). The extension ships with localhost +
-`*.wikipedia.org` permissions.
+When saving a hosted API URL, Chrome asks for permission only for that host. The
+server already permits Wikipedia origins for the content-script badge request.
 
 ## Scope (honest limits)
 

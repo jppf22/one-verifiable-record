@@ -4,7 +4,7 @@
 // links into the merge view.
 (async () => {
   const cfg = await chrome.storage.sync.get({
-    apiBase: "http://localhost:8000",
+    apiBase: "http://localhost:8080",
     webBase: "http://localhost:8080",
     enabled: true,
   });

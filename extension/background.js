@@ -3,7 +3,7 @@
 // change the API/web base URLs (e.g. the Verda VM address for the demo).
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.sync.set({
-    apiBase: "http://localhost:8000",
+    apiBase: "http://localhost:8080",
     webBase: "http://localhost:8080",
     enabled: true,
   });
