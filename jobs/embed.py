@@ -211,6 +211,7 @@ def run(model, table: str, batch_size: int, limit: int, model_name: str = "",
         
         batch_valid = 0
         batch_invalid = 0
+        batch_written = 0
         
         for (row_id, _text), emb in zip(rows, embs):
             quality_score = 1.0  # Default to perfect if not validating
@@ -236,6 +237,7 @@ def run(model, table: str, batch_size: int, limit: int, model_name: str = "",
                     f"model = VALUES(model), embedding_quality = VALUES(embedding_quality)",
                     (row_id, vec_literal(emb), model_name or None, quality_score),
                 )
+                batch_written += 1
             except Exception as e:
                 print(f"{table}: failed to insert embedding for id {row_id}: {e}", file=sys.stderr)
                 conn.rollback()
@@ -264,6 +266,12 @@ def run(model, table: str, batch_size: int, limit: int, model_name: str = "",
             print(f"{table}: embedded {total} rows ({rate:.0f} rows/s) "
                   f"[valid: {valid}, invalid: {invalid}]", file=sys.stderr)
         
+        # Rows that failed stay unembedded and would be selected again forever.
+        if not batch_written:
+            print(f"{table}: no row of this batch could be stored; stopping "
+                  f"(see the errors above)", file=sys.stderr)
+            break
+
         # Checkpoint commit
         if checkpoint_interval and total >= checkpoint_interval:
             conn.commit()
@@ -285,6 +293,16 @@ def ensure_vector_index(table: str):
     """
     conn = connect()
     cur = conn.cursor()
+    # Current schema keeps vectors in separate NOT NULL tables (claim_embeddings,
+    # chunk_embeddings) that are created with their VECTOR INDEX: nothing to do.
+    cur.execute(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = 'embedding'",
+        (table,),
+    )
+    if not cur.fetchone()[0]:
+        conn.close()
+        return
     cur.execute(f"SELECT COUNT(*), SUM(embedding IS NULL) FROM {table}")
     total, missing = cur.fetchone()
     if not total or missing:
