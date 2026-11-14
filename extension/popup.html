@@ -1,34 +1,140 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
+  <title>One Verifiable Record</title>
   <style>
-    body { font: 13px system-ui, sans-serif; width: 300px; padding: 12px; }
-    label { display: block; margin-top: 8px; font-weight: 600; }
-    input[type="text"] { width: 100%; margin-top: 2px; padding: 5px 7px; }
-    .row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
-    button { padding: 5px 12px; }
-    #status { margin-left: 8px; color: #137333; }
-    #status.error { color: #b32424; display: block; margin: 8px 0 0; }
-    .note { color: #54595d; line-height: 1.4; margin: 10px 0 0; }
+    * { box-sizing: border-box; }
+    body {
+      font: 13px/1.4 system-ui, -apple-system, sans-serif;
+      width: 330px;
+      margin: 0;
+      padding: 13px 14px;
+      color: #202122;
+      background: #fff;
+    }
+    header { margin-bottom: 10px; }
+    header h1 { font-size: 14.5px; margin: 0; }
+    header p { margin: 2px 0 0; color: #54595d; font-size: 12px; }
+    label.field { display: block; margin-top: 9px; font-weight: 600; font-size: 12.5px; }
+    input[type="text"] {
+      width: 100%;
+      margin-top: 3px;
+      padding: 5px 8px;
+      border: 1px solid #a2a9b1;
+      border-radius: 4px;
+      font: 12.5px system-ui, sans-serif;
+    }
+    .toggles { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-top: 11px;
+      font-weight: 600;
+      font-size: 12.5px;
+    }
+    .link-btn {
+      border: 0;
+      background: none;
+      color: #36c;
+      padding: 0;
+      font: 600 11.5px system-ui, sans-serif;
+      cursor: pointer;
+    }
+    .link-btn:hover { text-decoration: underline; }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 5px;
+    }
+    .chip {
+      border: 1px solid #c8ccd1;
+      background: #f8f9fa;
+      color: #202122;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font: 600 11.5px/1.3 system-ui, sans-serif;
+      cursor: pointer;
+    }
+    .chip[aria-pressed="true"] {
+      background: #36c;
+      border-color: #36c;
+      color: #fff;
+    }
+    .hint { color: #54595d; font-size: 11.5px; margin: 4px 0 0; }
+    .actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #eaecf0;
+    }
+    button.primary {
+      padding: 5px 14px;
+      border: 1px solid #36c;
+      border-radius: 4px;
+      background: #36c;
+      color: #fff;
+      font: 600 12.5px system-ui, sans-serif;
+      cursor: pointer;
+    }
+    a.app-link { color: #36c; font-weight: 600; font-size: 12px; text-decoration: none; }
+    a.app-link:hover { text-decoration: underline; }
+    #status { font-size: 12px; color: #137333; margin-top: 6px; min-height: 16px; }
+    #status.error { color: #b32424; }
+    .note { color: #54595d; font-size: 11.5px; line-height: 1.4; margin: 6px 0 0; }
   </style>
 </head>
 <body>
-  <b>One Verifiable Record</b>
-  <label>API base URL (web app address; it proxies /api)
-    <input type="text" id="apiBase">
+  <header>
+    <h1>One Verifiable Record</h1>
+    <p>Cross-language Wikipedia consistency companion (fi · sv · en)</p>
+  </header>
+
+  <label class="field">API base URL (FastAPI or web proxy)
+    <input type="text" id="apiBase" placeholder="http://localhost:8000">
   </label>
-  <label>Web app URL (comparison view)
-    <input type="text" id="webBase">
+
+  <label class="field">Web app URL (comparison view)
+    <input type="text" id="webBase" placeholder="http://localhost:8080">
   </label>
-  <div class="row">
-    <label style="margin:0">
-      <input type="checkbox" id="enabled"> Badge enabled
+
+  <div class="toggles">
+    <label class="toggle-row">
+      <input type="checkbox" id="enabled">
+      <span>Show badge on tracked Wikipedia pages</span>
     </label>
-    <button id="save">Save</button>
+    <label class="toggle-row">
+      <input type="checkbox" id="inlineFindings">
+      <span>Show inline claim highlights (matching snapshots)</span>
+    </label>
   </div>
+
+  <div class="section-head">
+    <span>Filter inline claim types</span>
+    <button type="button" id="clearKinds" class="link-btn" hidden>Show all types</button>
+  </div>
+  <div id="kindFilters" class="chips" role="group" aria-label="Filter inline claim types"></div>
+  <p class="hint">Empty selection paints all claim types.</p>
+
+  <div class="actions">
+    <a id="openWeb" class="app-link" href="http://localhost:8080" target="_blank" rel="noopener">Open comparison app ↗</a>
+    <button type="button" id="save" class="primary">Save</button>
+  </div>
+
   <div id="status" role="status" aria-live="polite"></div>
-  <p class="note">The badge appears only on tracked fi, sv and en article pages. Findings refer to the imported source revision.</p>
+  <p class="note">Findings come from the imported snapshot revision and never edit Wikipedia.</p>
+
   <script src="popup.js"></script>
 </body>
 </html>

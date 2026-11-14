@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "One Verifiable Record",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Shows precomputed cross-language comparison findings for tracked Finnish, Swedish and English Wikipedia articles.",
   "permissions": ["storage"],
   "host_permissions": [
@@ -18,7 +18,8 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_title": "One Verifiable Record"
   },
   "content_scripts": [
     {
