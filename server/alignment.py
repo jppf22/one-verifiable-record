@@ -1,21 +1,23 @@
 """Cross-language claim alignment via MariaDB vector search.
 
-All matching is a single SQL statement: nearest cross-language claims by
-VEC_DISTANCE_COSINE over the HNSW-indexed claim embeddings, restricted to the
-same Wikidata entity (the same article across editions). No vectors leave the
-database; MariaDB is the matching engine.
+Page-centric: the claims of page X are matched against the claims of each of
+its counterpart pages (page_links). Matching is one SQL statement per
+(claim, counterpart page): nearest claims by VEC_DISTANCE_COSINE over the
+claim_embeddings vectors. No vectors leave the database; MariaDB is the
+matching engine. Relation labels are deliberately not a hard filter: an AI
+extractor may map equivalent relations differently across languages, and the
+semantic verdict layer decides whether they are same, related or different.
 """
 from config import settings
 from db import get_conn, query
+from pages import comparison_set
 
 NEAREST_SQL = """
-SELECT c2.id AS claim_b, c2.statement_text, a2.lang AS other_lang,
+SELECT c2.id AS claim_b,
        VEC_DISTANCE_COSINE(e2.embedding, e1.embedding) AS dist
 FROM claims c1
 JOIN claim_embeddings e1 ON e1.claim_id = c1.id
-JOIN articles a1 ON a1.id = c1.article_id
-JOIN articles a2 ON a2.wikidata_qid = a1.wikidata_qid AND a2.lang <> a1.lang
-JOIN claims c2 ON c2.article_id = a2.id
+JOIN claims c2 ON c2.article_id = %s
 JOIN claim_embeddings e2 ON e2.claim_id = c2.id
 WHERE c1.id = %s
 ORDER BY dist ASC
@@ -23,36 +25,41 @@ LIMIT %s
 """
 
 
-def align_article(qid: str, k: int | None = None):
-    """Store candidate cross-language links for every claim of this Wikidata
-    entity. Candidate links start as 'unmatched'; verdicts.py then grades them.
+def align_page(page_id: int, k: int | None = None, max_distance: float | None = None):
+    """Store candidate links between claims of this page and claims of its
+    counterpart pages. Candidates start as 'unmatched'; verdicts.py grades them.
 
-    Returns {"claims": n, "candidate_links": m}.
+    Returns {"claims": n, "counterparts": p, "candidate_links": m}.
     """
     k = k or settings.nearest_k
+    max_distance = settings.match_distance if max_distance is None else max_distance
+    others = comparison_set(page_id)[1:]
     claims = query(
         """SELECT c.id FROM claims c
-           JOIN articles a ON a.id = c.article_id
-           WHERE a.wikidata_qid = %s
-           ORDER BY c.id""",
-        (qid,),
+           JOIN claim_embeddings e ON e.claim_id = c.id
+           WHERE c.article_id = %s ORDER BY c.id""",
+        (page_id,),
     )
     linked = 0
-    with get_conn() as conn:
-        cur = conn.cursor()
-        for row in claims:
-            cur.execute(NEAREST_SQL, (row["id"], k))
-            for claim_b, _text, _lang, dist in cur.fetchall():
-                if dist > settings.match_distance:
-                    continue
-                cur.execute(
-                    """INSERT IGNORE INTO claim_links
-                       (claim_a, claim_b, similarity, verdict, verdict_source)
-                       VALUES (%s, %s, %s, 'unmatched', 'deterministic')""",
-                    # store each pair once, in canonical (lower id, higher id)
-                    # order, so a->b and b->a don't become two links
-                    (min(row["id"], claim_b), max(row["id"], claim_b), 1.0 - dist),
-                )
-                linked += cur.rowcount
-        conn.commit()
-    return {"claims": len(claims), "candidate_links": linked}
+    if others and claims:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            for row in claims:
+                for other in others:
+                    cur.execute(NEAREST_SQL, (other, row["id"], k))
+                    for claim_b, dist in cur.fetchall():
+                        if dist is None or dist > max_distance:
+                            continue
+                        cur.execute(
+                            """INSERT IGNORE INTO claim_links
+                               (claim_a, claim_b, similarity, candidate_confidence,
+                                verdict, verdict_source)
+                               VALUES (%s, %s, %s, %s, 'unmatched', 'deterministic')""",
+                            # each pair once, canonical (lower id, higher id) order,
+                            # so a->b and b->a don't become two links
+                            (min(row["id"], claim_b), max(row["id"], claim_b),
+                             1.0 - dist, 1.0 - dist),
+                        )
+                        linked += cur.rowcount
+            conn.commit()
+    return {"claims": len(claims), "counterparts": len(others), "candidate_links": linked}

@@ -17,9 +17,12 @@ class Settings(BaseSettings):
     # Verda's gateway has no embeddings endpoint: we serve e5 ourselves (embedder/)
     embed_base_url: str = "http://embedder:8001/v1"
 
-    # alignment: max cosine distance to consider two claims a candidate match
-    match_distance: float = 0.35
-    nearest_k: int = 3
+    # Discovery-oriented alignment. These are intentionally generous: vector
+    # search proposes candidates, while semantic grading decides whether they
+    # are the same fact or a possible/confirmed conflict.
+    match_distance: float = 0.28
+    nearest_k: int = 12
+    counterpart_min_confidence: float = 0.90
     top_k: int = 8
 
 

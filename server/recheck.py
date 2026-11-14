@@ -1,4 +1,4 @@
-"""Re-check an article (Wikidata entity) after a review or a patch export.
+"""Re-check a page against its counterpart pages after a review or a patch export.
 
 A human review never overwrites the machine verdict. Instead the pipeline runs
 again against what is currently in MariaDB and reports whether each conflict
@@ -15,39 +15,42 @@ from datetime import datetime
 import alignment
 import verdicts
 from db import query, query_one
-from diff import build_merge_view, status_counts
+from diff import page_summary
+from verdicts import page_links_where
 
-# Graded links of this entity whose claims changed after the verdict was
-# computed. computed_at is a second-precision TIMESTAMP while ROW_START has
-# microseconds, so we compare against the next whole second; otherwise a claim
-# written in the same second as the link would look "newer" forever.
+# Graded links of this page (to its counterparts) whose claims changed after the
+# verdict was computed. computed_at is a second-precision TIMESTAMP while
+# ROW_START has microseconds, so we compare against the next whole second;
+# otherwise a claim written in the same second as the link would look "newer"
+# forever. {where} uses the PAIR_SELECT aliases (aa/ab = the two pages).
 STALE_LINKS_SQL = """
 SELECT cl.id, MAX(h.ROW_START) AS claim_changed_at
 FROM claim_links cl
-JOIN claims c ON c.id = cl.claim_a
-JOIN articles a ON a.id = c.article_id
+JOIN claims ca ON ca.id = cl.claim_a
+JOIN articles aa ON aa.id = ca.article_id
+JOIN claims cb ON cb.id = cl.claim_b
+JOIN articles ab ON ab.id = cb.article_id
 JOIN claims FOR SYSTEM_TIME ALL AS h
      ON h.id IN (cl.claim_a, cl.claim_b)
     AND h.ROW_START >= cl.computed_at + INTERVAL 1 SECOND
-WHERE a.wikidata_qid = %s AND cl.verdict <> 'unmatched'
+WHERE {where}
 GROUP BY cl.id
 """
 
-
-def _link_verdicts(qid: str) -> dict:
-    rows = query(
-        """SELECT cl.id, cl.verdict
-           FROM claim_links cl
-           JOIN claims c ON c.id = cl.claim_a
-           JOIN articles a ON a.id = c.article_id
-           WHERE a.wikidata_qid = %s""",
-        (qid,),
-    )
-    return {r["id"]: r["verdict"] for r in rows}
+LINK_VERDICTS_SQL = """
+SELECT cl.id, cl.verdict
+FROM claim_links cl
+JOIN claims ca ON ca.id = cl.claim_a
+JOIN articles aa ON aa.id = ca.article_id
+JOIN claims cb ON cb.id = cl.claim_b
+JOIN articles ab ON ab.id = cb.article_id
+WHERE {where}
+"""
 
 
-def _summary(qid: str) -> dict:
-    return status_counts(build_merge_view(qid, with_reviews=False)["clusters"])
+def _link_verdicts(page_id: int) -> dict:
+    where, params = page_links_where(page_id)
+    return {r["id"]: r["verdict"] for r in query(LINK_VERDICTS_SQL.format(where=where), params)}
 
 
 def _now_iso() -> str:
@@ -58,26 +61,27 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def recheck_article(qid: str, focus_link_ids=None) -> dict:
+def recheck_page(page_id: int, focus_link_ids=None) -> dict:
     focus = list(dict.fromkeys(int(i) for i in (focus_link_ids or [])))
 
-    before_summary = _summary(qid)
-    before_verdicts = _link_verdicts(qid)
+    before_summary = page_summary(page_id)
+    before_verdicts = _link_verdicts(page_id)
 
-    # 1. vector alignment: new cross-language candidate links ('unmatched')
-    new_links = alignment.align_article(qid)["candidate_links"]
+    # 1. vector alignment: new candidate links to counterpart pages ('unmatched')
+    new_links = alignment.align_page(page_id)["candidate_links"]
 
     # 2. grade every 'unmatched' link (new candidates + never graded)
-    results: dict = {r["id"]: r for r in verdicts.grade_unmatched(qid)}
+    results: dict = {r["id"]: r for r in verdicts.grade_unmatched(page_id)}
 
     # 3. regrade graded links whose claims have a newer SVT row, plus focus links
-    stale = [r["id"] for r in query(STALE_LINKS_SQL, (qid,))]
+    where, params = page_links_where(page_id, "cl.verdict <> 'unmatched'")
+    stale = [r["id"] for r in query(STALE_LINKS_SQL.format(where=where), params)]
     to_regrade = [i for i in dict.fromkeys(stale + focus) if i not in results]
     pairs = verdicts.fetch_pairs_by_ids(to_regrade)
     for r in verdicts.grade_links(pairs, touch_ids=set(stale)):
         results[r["id"]] = r
 
-    after_summary = _summary(qid)
+    after_summary = page_summary(page_id)
 
     links = []
     for link_id in dict.fromkeys(focus + sorted(results)):
@@ -87,7 +91,7 @@ def recheck_article(qid: str, focus_link_ids=None) -> dict:
         if link_id not in focus and not r["changed"]:
             continue
         # newly aligned links didn't exist before the re-check -> before = null
-        before = before_verdicts.get(link_id)
+        before = before_verdicts.get(link_id, r["before"] if link_id in focus else None)
         after = r["after"]
         links.append(
             {
@@ -101,7 +105,7 @@ def recheck_article(qid: str, focus_link_ids=None) -> dict:
         )
 
     return {
-        "qid": qid,
+        "page_id": page_id,
         "checked_at": _now_iso(),
         "before": before_summary,
         "after": after_summary,

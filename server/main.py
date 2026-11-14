@@ -1,25 +1,32 @@
-"""One Verifiable Record — API server.
+"""One Verifiable Record — API server (page-centric, docs/page-contract.md).
 
-Endpoints (see /docs for the interactive reference):
+The unit of comparison is a PAGE (one language edition, one revision), compared
+with its counterpart pages (page_links). Endpoints (see /docs):
   GET  /api/health
-  GET  /api/articles?q=...                 search tracked articles
-  GET  /api/articles/by-title?lang&title   resolve one edition
-  POST /api/align/{qid}                    run alignment + verdict layers
-  GET  /api/merge/{qid}                    git-diff-style merged view (+ summary,
-                                           latest review per link, wiki permalinks)
-  POST /api/recheck/{qid}                  re-check the article; body (optional)
-                                           {"focus_link_ids": [...]}; reports which
-                                           conflicts resurface
-  GET  /api/badge?lang&title               extension summary badge (+ conflicts, gaps)
+  GET  /api/pages?q=&lang=                 title search; pages with >=1 counterpart
+  GET  /api/pages/conflicted?limit=50      landing list, most conflicted first
+                                           (SQL aggregation, claim-level counts)
+  GET  /api/pages/by-title?lang&title      resolve one page (+ counterparts)
+  GET  /api/pages/{id}                     page + counterparts
+  POST /api/pages/{id}/align               vector alignment + verdict layers
+  GET  /api/pages/{id}/compare             comparison payload (rows relative to
+                                           this page: conflict / missing_here /
+                                           only_here / possible match / agree)
+  POST /api/pages/{id}/recheck             re-check; body (optional)
+                                           {"focus_link_ids": [...]}
+  GET  /api/pages/{id}/suggestions         generate (deduplicated) + list drafts
+  POST /api/suggestions/{id}/export        mark a draft exported, then re-check
   GET  /api/claims/{id}/history            biography of a claim + its links and
                                            their reviews (FOR SYSTEM_TIME ALL)
-  POST /api/reviews                        human-in-the-loop review, then re-check
+  POST /api/reviews                        human review, then re-check claim_a's page
   GET  /api/reviews?link_id=               reviews of one link, newest first
-  GET  /api/suggestions/{qid}              generate (deduplicated) + list patch drafts
-  POST /api/suggestions/{id}/export        mark a draft exported, then re-check
-  GET  /api/qa?qid&q                       grounded Q&A with citations
+  GET  /api/qa?page=&q=&lang=              grounded Q&A over the comparison set
+  GET  /api/badge?lang&title               extension badge
+  GET  /api/extension/resolve              page-id-first extension resolver
+  GET  /api/extension/annotations           snapshot-safe inline annotation data
 
-The full request/response shapes live in docs/frontend-contract.md.
+The old QID endpoints (/articles, /merge, /align, /recheck, /suggestions/{qid})
+are removed. wikidata_qid is an import-time detail only.
 """
 from typing import Optional
 
@@ -29,13 +36,14 @@ from pydantic import BaseModel
 
 import alignment
 import diff
+import pages
 import patches
 import rag
 import recheck
 import verdicts
 from db import insert, placeholders, query, query_one
 
-app = FastAPI(title="One Verifiable Record", version="0.1.0")
+app = FastAPI(title="One Verifiable Record", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,90 +59,310 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/articles")
-def search_articles(q: str = Query(min_length=2), limit: int = 25):
-    """Search tracked articles that are aligned across languages (have a QID)."""
+def _page_or_404(page_id: int) -> dict:
+    page = pages.get_page(page_id)
+    if not page:
+        raise HTTPException(404, "page not tracked")
+    return page
+
+
+def _by_title_or_404(lang: str, title: str):
+    """(page, counterparts); 404 unless tracked and with >=1 counterpart."""
+    page = pages.find_by_title(lang, title)
+    if not page:
+        raise HTTPException(404, "page not tracked")
+    cps = pages.counterparts(page["id"])
+    if not cps:
+        raise HTTPException(404, "page has no counterpart pages")
+    return page, cps
+
+
+@app.get("/api/pages")
+def search_pages(q: str = Query(min_length=2), lang: Optional[str] = None,
+                 limit: int = Query(25, ge=1, le=100)):
+    """Title search over pages that have at least one counterpart page."""
+    lang_sql = " AND a.lang = %s" if lang else ""
     rows = query(
-        """SELECT a.id, a.lang, a.title, a.wikidata_qid, a.revision_id
-           FROM articles a
-           WHERE a.title LIKE %s AND a.wikidata_qid IS NOT NULL
-           ORDER BY a.title
-           LIMIT %s""",
-        (f"%{q}%", limit),
+        f"""SELECT {pages.PAGE_COLS} FROM articles a
+            WHERE a.title LIKE %s{lang_sql}
+              AND EXISTS (SELECT 1 FROM page_links pl
+                          WHERE pl.page_a = a.id AND pl.page_b <> a.id)
+            ORDER BY (a.title = %s) DESC, (a.title LIKE %s) DESC, a.title, a.lang
+            LIMIT %s""",
+        tuple([f"%{q}%"] + ([lang] if lang else []) + [q, f"{q}%", limit]),
     )
-    # collapse to one row per Wikidata entity (first title wins)
-    seen, out = set(), []
-    for r in rows:
-        if r["wikidata_qid"] in seen:
-            continue
-        seen.add(r["wikidata_qid"])
-        out.append(r)
-    return out
+    ids = [r["id"] for r in rows]
+    cps = pages.counterparts_many(ids)
+    conflicts = pages.conflict_counts(ids)
+    return [
+        {"page": pages.page_obj(r), "counterparts": cps[r["id"]],
+         "conflicts": conflicts[r["id"]]}
+        for r in rows
+    ]
 
 
-@app.get("/api/articles/by-title")
-def by_title(lang: str, title: str):
-    row = query_one(
-        "SELECT id, lang, title, wikidata_qid, revision_id FROM articles "
-        "WHERE lang = %s AND title = %s",
-        (lang, title),
-    )
-    if not row:
-        raise HTTPException(404, "article not tracked")
-    return row
+@app.get("/api/pages/conflicted")
+def conflicted_pages(limit: int = Query(50, ge=1, le=200)):
+    """Landing list: pages with counterparts, most conflicted first. Computed
+    with SQL aggregation over claim_links (claim-level counts), not by building
+    comparison payloads."""
+    rows = pages.ranked_pages(limit)
+    ids = [r["id"] for r in rows]
+    cps = pages.counterparts_many(ids)
+    stats = pages.page_stats(ids)
+    return [
+        {"page": pages.page_obj(r), "counterparts": cps[r["id"]], **stats[r["id"]]}
+        for r in rows
+    ]
 
 
-@app.post("/api/align/{qid}")
-def align(qid: str):
-    """Align claims across this entity's editions, then grade the links."""
-    counts = alignment.align_article(qid)
-    verdict_counts = verdicts.run_verdicts(qid)
-    return {"qid": qid, **counts, "verdicts": verdict_counts}
+@app.get("/api/pages/by-title")
+def page_by_title(lang: str, title: str):
+    page, cps = _by_title_or_404(lang, title)
+    return {"page": page, "counterparts": cps}
 
 
-@app.get("/api/merge/{qid}")
-def merge(qid: str):
-    return diff.build_merge_view(qid)
+@app.get("/api/pages/{page_id}")
+def page_detail(page_id: int):
+    page = _page_or_404(page_id)
+    return {"page": page, "counterparts": pages.counterparts(page_id)}
+
+
+@app.post("/api/pages/{page_id}/align")
+def align_page(page_id: int):
+    """Align this page's claims with its counterpart pages, then grade the links."""
+    _page_or_404(page_id)
+    counts = alignment.align_page(page_id)
+    verdict_counts = verdicts.run_verdicts(page_id)
+    return {"page_id": page_id, **counts, "verdicts": verdict_counts}
+
+
+@app.get("/api/pages/{page_id}/compare")
+def compare_page(page_id: int):
+    view = diff.build_comparison(page_id)
+    if view is None:
+        raise HTTPException(404, "page not tracked")
+    return view
 
 
 class RecheckRequest(BaseModel):
     focus_link_ids: list[int] = []
 
 
-@app.post("/api/recheck/{qid}")
-def recheck_article(qid: str, body: Optional[RecheckRequest] = None):
-    """Re-run alignment + grading for this entity and report what resurfaced."""
-    if not query_one("SELECT 1 AS ok FROM articles WHERE wikidata_qid = %s LIMIT 1", (qid,)):
-        raise HTTPException(404, "article not tracked")
-    return recheck.recheck_article(qid, body.focus_link_ids if body else [])
+@app.post("/api/pages/{page_id}/recheck")
+def recheck_page(page_id: int, body: Optional[RecheckRequest] = None):
+    """Re-run alignment + grading for this page and report what resurfaced."""
+    _page_or_404(page_id)
+    return recheck.recheck_page(page_id, body.focus_link_ids if body else [])
+
+
+@app.get("/api/pages/{page_id}/suggestions")
+def page_suggestions(page_id: int):
+    """Generate patch drafts for this page and its counterparts, list them."""
+    result = patches.generate_suggestions(page_id)
+    if result is None:
+        raise HTTPException(404, "page not tracked")
+    return result
 
 
 @app.get("/api/badge")
 def badge(lang: str, title: str):
-    """Summary for the browser extension: verdict counts + merge-view target."""
-    row = query_one(
-        "SELECT id, wikidata_qid FROM articles WHERE lang = %s AND title = %s",
-        (lang, title),
-    )
-    if not row or not row["wikidata_qid"]:
-        raise HTTPException(404, "article not tracked")
-    counts = query(
-        """SELECT cl.verdict, COUNT(*) AS n
-           FROM claim_links cl
-           JOIN claims c ON c.id = cl.claim_a
-           JOIN articles a ON a.id = c.article_id
-           WHERE a.wikidata_qid = %s
-           GROUP BY cl.verdict""",
-        (row["wikidata_qid"],),
-    )
-    clusters = diff.build_merge_view(row["wikidata_qid"], with_reviews=False)["clusters"]
-    status = diff.status_counts(clusters)
+    """Summary for the browser extension: this page's status counts + verdicts."""
+    page, cps = _by_title_or_404(lang, title)
+    view = diff.build_comparison(page["id"], with_reviews=False, page=page, cps=cps)
+    counts: dict = {}
+    for row in view["rows"]:
+        for link in row["links"]:
+            counts[link["verdict"]] = counts.get(link["verdict"], 0) + 1
+    s = view["summary"]
     return {
-        "qid": row["wikidata_qid"],
-        "counts": {r["verdict"]: r["n"] for r in counts},
-        "conflicts": status["conflict"],
-        "gaps": status["gap"],
+        "page": page,
+        "counterparts": cps,
+        "conflicts": s["conflict"],
+        "possible_conflicts": s["possible_conflict"],
+        "missing_here": s["missing_here"],
+        "only_here": s["only_here"],
+        "possible_matches": s["possible_match"],
+        "agree": s["agree"],
+        "counts": counts,
     }
+
+
+@app.get("/api/extension/resolve")
+def extension_resolve(
+    lang: str,
+    wiki_page_id: Optional[int] = Query(None, ge=1),
+    title: Optional[str] = Query(None, min_length=1, max_length=512),
+    live_revision_id: Optional[int] = Query(None, ge=1),
+):
+    """Resolve a live Wikipedia page for the Chromium companion.
+
+    This endpoint deliberately returns ``tracked: false`` for ordinary
+    non-membership rather than making the extension treat it as an error. A
+    page id is authoritative; title lookup is only a legacy/browser fallback.
+    Findings are precomputed from the imported snapshot and are accompanied by
+    a freshness state when the browser supplies a live revision id.
+    """
+    if lang not in pages.LANG_ORDER:
+        return {"tracked": False, "reason": "unsupported_language"}
+
+    page = pages.find_by_wiki_page_id(lang, wiki_page_id) if wiki_page_id else None
+    # A page id is authoritative, but title is still useful for older skins
+    # that report a transient/missing id while navigating.
+    if page is None and title:
+        page = pages.find_by_title(lang, title)
+    if page is None:
+        return {"tracked": False, "reason": "not_imported"}
+
+    cps = pages.counterparts(page["id"])
+    if not cps:
+        return {"tracked": False, "reason": "no_counterparts"}
+
+    view = diff.build_comparison(page["id"], with_reviews=False, page=page, cps=cps)
+    s = view["summary"]
+    has_claims = bool(query_one("SELECT 1 AS ok FROM claims WHERE article_id = %s LIMIT 1",
+                                (page["id"],)))
+    if live_revision_id is None:
+        freshness = "unknown"
+    elif page["revision_id"] == live_revision_id:
+        freshness = "current"
+    else:
+        freshness = "stale"
+
+    return {
+        "tracked": True,
+        "page": page,
+        "counterparts": cps,
+        "analysed_revision_id": page["revision_id"],
+        "live_revision_id": live_revision_id,
+        "freshness": freshness,
+        "analysis_status": "ready" if has_claims else "not_ready",
+        "dataset_key": f"{page['id']}:{page['revision_id'] or 'unknown'}",
+        "conflicts": s["conflict"],
+        "possible_conflicts": s.get("possible_conflict", 0),
+        "missing_here": s["missing_here"],
+        "only_here": s["only_here"],
+        "possible_matches": s.get("possible_match", 0),
+        "agree": s["agree"],
+    }
+
+
+def _extension_page(lang: str, wiki_page_id: Optional[int], title: Optional[str]):
+    """Resolve an extension request without treating ordinary misses as errors."""
+    if lang not in pages.LANG_ORDER:
+        return None, "unsupported_language"
+    page = pages.find_by_wiki_page_id(lang, wiki_page_id) if wiki_page_id else None
+    if page is None and title:
+        page = pages.find_by_title(lang, title)
+    if page is None:
+        return None, "not_imported"
+    if not pages.counterparts(page["id"]):
+        return None, "no_counterparts"
+    return page, None
+
+
+def _annotation_claim(claim: dict) -> dict:
+    """The small, stable claim representation consumed by the extension."""
+    return {
+        "id": claim["id"],
+        "lang": claim["lang"],
+        "text": claim.get("statement_text") or "",
+        "context": claim.get("context_text") or "",
+        "value": claim.get("value_text") or claim.get("value_normalized") or "",
+        "predicate": claim.get("predicate") or "claim",
+        "revision_id": claim.get("revision_id"),
+        "revision_url": claim.get("url"),
+    }
+
+
+def _annotation_link(link: dict, claim_ids: set[int]) -> dict:
+    """Receipt information only; no scoring/recomputation happens on visits."""
+    return {
+        "id": link["id"],
+        "verdict": link.get("verdict"),
+        "evidence": link.get("evidence") or "",
+        "rationale": link.get("rationale") or "",
+        "confidence": link.get("candidate_confidence"),
+        "similarity": link.get("similarity"),
+        "local": link.get("claim_a") in claim_ids or link.get("claim_b") in claim_ids,
+    }
+
+
+def _annotation_payload(view: dict) -> tuple[list, list]:
+    """Project comparison rows to local marks and overlay-only missing rows."""
+    annotations, missing_here = [], []
+    annotatable = {"conflict", "possible_conflict", "only_here", "possible_match"}
+    for row in view["rows"]:
+        status = row["status"]
+        counterparts = [_annotation_claim(c) for claims in row["there"].values() for c in claims]
+        if status == "missing_here":
+            missing_here.append({
+                "row_key": row["key"], "status": status,
+                "predicate": row.get("predicate") or "claim",
+                "counterparts": counterparts,
+                "links": [_annotation_link(link, set()) for link in row["links"]],
+            })
+            continue
+        if status not in annotatable:
+            continue
+        for local in row["here"]:
+            local_id = local["id"]
+            links = [link for link in row["links"]
+                     if link.get("claim_a") == local_id or link.get("claim_b") == local_id]
+            annotations.append({
+                "row_key": row["key"],
+                "status": status,
+                "claim": _annotation_claim(local),
+                "counterparts": counterparts,
+                "links": [_annotation_link(link, {local_id}) for link in links],
+                # The web app's hash route is deliberately represented as data
+                # so a separately deployed extension need not know its host.
+                "focus": {"lang": view["page"]["lang"], "title": view["page"]["title"],
+                          "row_key": row["key"]},
+            })
+    return annotations, missing_here
+
+
+@app.get("/api/extension/annotations")
+def extension_annotations(
+    lang: str,
+    wiki_page_id: Optional[int] = Query(None, ge=1),
+    title: Optional[str] = Query(None, min_length=1, max_length=512),
+    live_revision_id: Optional[int] = Query(None, ge=1),
+):
+    """Return already-computed inline findings for one exact live revision.
+
+    This is intentionally a read-only projection of ``diff.build_comparison``.
+    It never aligns claims or invokes a model while somebody reads Wikipedia.
+    """
+    page, reason = _extension_page(lang, wiki_page_id, title)
+    if page is None:
+        return {"tracked": False, "reason": reason, "annotations": [], "missing_here": []}
+
+    has_claims = bool(query_one("SELECT 1 AS ok FROM claims WHERE article_id = %s LIMIT 1",
+                                (page["id"],)))
+    freshness = ("unknown" if live_revision_id is None else
+                 "current" if page["revision_id"] == live_revision_id else "stale")
+    ready = has_claims
+    base = {
+        "tracked": True,
+        "page": page,
+        "analysed_revision_id": page["revision_id"],
+        "live_revision_id": live_revision_id,
+        "freshness": freshness,
+        "analysis_status": "ready" if ready else "not_ready",
+        "annotations": [],
+        "missing_here": [],
+    }
+    # Exact snapshot equality is a safety boundary: never make marks on a
+    # changed page or one whose live revision cannot be established.
+    if freshness != "current" or not ready:
+        return base
+
+    view = diff.build_comparison(page["id"], with_reviews=False, page=page,
+                                 cps=pages.counterparts(page["id"]))
+    annotations, missing_here = _annotation_payload(view)
+    return {**base, "annotations": annotations, "missing_here": missing_here}
 
 
 @app.get("/api/claims/{claim_id}/history")
@@ -177,10 +405,9 @@ def create_review(r: Review):
     if r.decision not in ("agree", "disagree", "fix"):
         raise HTTPException(422, "decision must be agree | disagree | fix")
     link = query_one(
-        """SELECT cl.id, a.wikidata_qid
+        """SELECT cl.id, c.article_id AS page_id
            FROM claim_links cl
            JOIN claims c ON c.id = cl.claim_a
-           JOIN articles a ON a.id = c.article_id
            WHERE cl.id = %s""",
         (r.claim_link_id,),
     )
@@ -191,11 +418,9 @@ def create_review(r: Review):
         "VALUES (%s, %s, %s, %s)",
         (r.claim_link_id, r.reviewer, r.decision, r.note),
     )
-    # The review does not overwrite the machine verdict: re-check the article
-    # and report whether the conflict resurfaces (assumptions.md, decision 4).
-    result = None
-    if link["wikidata_qid"]:
-        result = recheck.recheck_article(link["wikidata_qid"], [r.claim_link_id])
+    # The review does not overwrite the machine verdict: re-check the page of
+    # claim_a and report whether the conflict resurfaces (assumptions.md, decision 4).
+    result = recheck.recheck_page(link["page_id"], [r.claim_link_id])
     return {"ok": True, "review_id": review_id, "recheck": result}
 
 
@@ -208,12 +433,6 @@ def list_reviews(link_id: int):
     )
 
 
-@app.get("/api/suggestions/{qid}")
-def suggestions(qid: str):
-    """Generate patch drafts for this entity and return them for export."""
-    return patches.generate_suggestions(qid)
-
-
 @app.post("/api/suggestions/{suggestion_id}/export")
 def export_suggestion(suggestion_id: int):
     """Mark a draft exported (SVT row), then re-check with focus on its link."""
@@ -221,12 +440,13 @@ def export_suggestion(suggestion_id: int):
     if not s:
         raise HTTPException(404, "suggestion not found")
     patches.mark_exported(suggestion_id)
-    result = None
-    if s["claim_link_id"] is not None and s["wikidata_qid"]:
-        result = recheck.recheck_article(s["wikidata_qid"], [s["claim_link_id"]])
+    focus = [s["claim_link_id"]] if s["claim_link_id"] is not None else []
+    result = recheck.recheck_page(s["page_id"], focus)
     return {"ok": True, "suggestion_id": suggestion_id, "recheck": result}
 
 
 @app.get("/api/qa")
-def qa(qid: str, q: str = Query(min_length=2), lang: Optional[str] = None):
-    return rag.answer(qid, q, lang)
+def qa(page: int, q: str = Query(min_length=2), lang: Optional[str] = None):
+    """Grounded Q&A over the comparison set of `page` (a page id)."""
+    _page_or_404(page)
+    return rag.answer(page, q, lang)
