@@ -8,8 +8,8 @@
     "https://fi.wikipedia.org/*",
     "https://sv.wikipedia.org/*",
     "https://en.wikipedia.org/*",
-    "http://localhost/*",
-    "http://127.0.0.1/*"
+    "http://localhost:*/*",
+    "http://127.0.0.1:*/*"
   ],
   "optional_host_permissions": [
     "https://*/*"

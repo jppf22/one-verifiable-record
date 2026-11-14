@@ -11,7 +11,7 @@ import json
 import httpx
 
 from config import settings
-from db import execute, placeholders, query
+from db import execute, placeholders, query, query_one
 from pages import comparison_set
 
 NUMERIC_TOLERANCE = 1e-9
@@ -20,6 +20,14 @@ VALID_VERDICTS = {
     "unverifiable", "definition_mismatch",
 }
 VALID_RELATIONS = {"same", "related", "different", "unknown"}
+
+# verdict_source values. 'deterministic-fallback' marks a verdict produced
+# without the LLM because the Verda API was unavailable, so a guess is never
+# presented as a model output. 'human' marks a reviewer override (Q1).
+SOURCE_DETERMINISTIC = "deterministic"
+SOURCE_LLM = "llm"
+SOURCE_FALLBACK = "deterministic-fallback"
+SOURCE_HUMAN = "human"
 
 
 def _same_fact(a: dict, b: dict) -> bool:
@@ -98,11 +106,17 @@ def deterministic_verdict(a: dict, b: dict) -> str | None:
 
 
 def llm_verdict(a: dict, b: dict):
-    """Contextual cross-language entailment via the Verda Inference API."""
+    """Contextual cross-language entailment via the Verda Inference API.
+
+    Returns (verdict, relation, confidence, rationale, available). ``available``
+    is False when the LLM layer could not run (no key, or request failed), so
+    the caller can mark the verdict ``deterministic-fallback`` instead of
+    presenting a guess as a model output.
+    """
     if not settings.verda_api_key:
         # Keep a loose vector candidate visible instead of misrepresenting it
         # as a confirmed gap when semantic verification is unavailable.
-        return "possible_match", "unknown", None, "no LLM configured (set VERDA_API_KEY)"
+        return "possible_match", "unknown", None, "no LLM configured (set VERDA_API_KEY)", False
     messages = [
         {
             "role": "system",
@@ -161,14 +175,15 @@ def llm_verdict(a: dict, b: dict):
             confidence = max(0.0, min(1.0, float(data.get("confidence"))))
         except (TypeError, ValueError):
             confidence = None
-        return verdict, relation, confidence, data.get("rationale", "")
+        return verdict, relation, confidence, data.get("rationale", ""), True
     except Exception as exc:  # degrade gracefully, never crash the pipeline
-        return "possible_match", "unknown", None, f"LLM error: {exc}"
+        return "possible_match", "unknown", None, f"LLM error: {exc}", False
 
 
 PAIR_SELECT = """
 SELECT cl.id AS link_id, cl.verdict AS verdict, cl.relation AS relation,
        cl.candidate_confidence AS candidate_confidence, cl.verdict_source AS verdict_source,
+       cl.similarity AS similarity, cl.verdict_confidence AS verdict_confidence,
        ca.id AS a_id, ca.kind AS a_kind, ca.statement_text AS a_text,
        ca.value_normalized AS a_value, ca.value_canonical AS a_canonical,
        ca.qualifiers AS a_qualifiers, ca.context_text AS a_context,
@@ -216,13 +231,64 @@ def fetch_pairs_by_ids(link_ids) -> list:
     return fetch_pairs(f"cl.id IN ({placeholders(link_ids)})", tuple(link_ids))
 
 
+def _predicate_match_score(a: dict, b: dict) -> float:
+    """How strongly the two claims' predicates agree: 1.0 for a shared Wikidata
+    property, 0.8 for an identical predicate string, 0.3 when neither side has a
+    predicate (unknown), 0.0 for a mismatch."""
+    pea, peb = a.get("predicate_entity"), b.get("predicate_entity")
+    if pea and peb:
+        return 1.0 if pea == peb else 0.0
+    pa, pb = (a.get("predicate") or "").lower(), (b.get("predicate") or "").lower()
+    if pa and pb:
+        return 0.8 if pa == pb else 0.0
+    return 0.3  # at least one side has no predicate: weak, not disqualifying
+
+
+def compute_confidence(a: dict, b: dict, source: str, similarity, llm_confidence) -> float:
+    """Combine the available signals into one 0..1 verdict confidence.
+
+    Pure function (no DB): easy to reason about and test. Weights:
+      - vector similarity 0.35 (how close the two claims are in meaning)
+      - predicate agreement 0.30 (same fact, not just similar wording)
+      - layer certainty 0.35 (deterministic = 1.0, LLM = its own confidence,
+        fallback discounted because the semantic layer never ran)
+    """
+    try:
+        sim = max(0.0, min(1.0, float(similarity)))
+    except (TypeError, ValueError):
+        sim = 0.0
+    pred = _predicate_match_score(a, b)
+    if source == SOURCE_DETERMINISTIC:
+        certainty = 1.0
+    elif source == SOURCE_HUMAN:
+        certainty = 1.0
+    elif source == SOURCE_LLM:
+        try:
+            certainty = max(0.0, min(1.0, float(llm_confidence)))
+        except (TypeError, ValueError):
+            certainty = 0.5  # model answered but gave no usable confidence
+    else:  # deterministic-fallback: semantic layer unavailable
+        certainty = 0.25
+    score = 0.35 * sim + 0.30 * pred + 0.35 * certainty
+    return round(max(0.0, min(1.0, score)), 4)
+
+
 def grade_pair(a: dict, b: dict):
-    """Grade one pair -> (verdict, source, rationale, relation, confidence)."""
+    """Grade one pair -> (verdict, source, rationale, relation, confidence).
+
+    ``confidence`` is the LLM's self-reported certainty (or None/1.0); the
+    combined verdict_confidence is computed per-link in grade_links where the
+    candidate similarity is known.
+    """
     det = deterministic_verdict(a, b)
     if det:
-        return det, "deterministic", "canonical value comparison", "same", 1.0
-    verdict, relation, confidence, rationale = llm_verdict(a, b)
-    return verdict, "llm", rationale, relation, confidence
+        return det, SOURCE_DETERMINISTIC, "canonical value comparison", "same", 1.0
+    verdict, relation, confidence, rationale, available = llm_verdict(a, b)
+    if not available:
+        # LLM layer could not run: keep the loose candidate but label it so a
+        # guess is never mistaken for a model verdict (task 1).
+        return verdict, SOURCE_FALLBACK, rationale, relation, confidence
+    return verdict, SOURCE_LLM, rationale, relation, confidence
 
 
 def grade_links(pairs, touch_ids=()) -> list:
@@ -232,12 +298,22 @@ def grade_links(pairs, touch_ids=()) -> list:
     bumped even when the verdict holds. That records "re-verified against the new
     claim version" in the link's history and stops them looking stale forever.
 
-    Returns [{id, before, after, changed}].
+    A link whose ``verdict_source`` is already ``human`` is never overwritten by
+    a machine regrade (Q1): the reviewer's decision stands until a human changes
+    it. Returns [{id, before, after, changed}].
     """
     results = []
     for p in pairs:
+        if p.get("verdict_source") == SOURCE_HUMAN:
+            # Honour the human override; report it as unchanged.
+            results.append(
+                {"id": p["link_id"], "before": p["verdict"],
+                 "after": p["verdict"], "changed": False}
+            )
+            continue
         a, b = _side(p, "a"), _side(p, "b")
         verdict, source, rationale, relation, confidence = grade_pair(a, b)
+        vconf = compute_confidence(a, b, source, p.get("similarity"), confidence)
         changed = (verdict, relation, confidence) != (
             p["verdict"], p.get("relation"), p.get("candidate_confidence"))
         if changed or p["link_id"] in touch_ids:
@@ -245,11 +321,11 @@ def grade_links(pairs, touch_ids=()) -> list:
             execute(
                 """UPDATE claim_links
                    SET verdict = %s, relation = %s, candidate_confidence = %s,
-                       verdict_source = %s, rationale = %s,
+                       verdict_confidence = %s, verdict_source = %s, rationale = %s,
                        evidence = CONCAT(%s, ' || ', %s),
                        computed_at = CURRENT_TIMESTAMP
                    WHERE id = %s""",
-                (verdict, relation, confidence, source, rationale,
+                (verdict, relation, confidence, vconf, source, rationale,
                  a["statement_text"], b["statement_text"],
                  p["link_id"]),
             )
@@ -284,3 +360,60 @@ def run_verdicts(page_id: int) -> dict:
     for r in grade_unmatched(page_id):
         counts[r["after"]] = counts.get(r["after"], 0) + 1
     return counts
+
+
+# Q1 (assumptions.md): a reviewer decision maps to a machine verdict. Default
+# API behaviour is still audit-log + re-check; this override is opt-in.
+HUMAN_DECISION_VERDICT = {
+    # agree keeps whatever the current verdict is, just re-stamped as human
+    "disagree": {
+        # disagree on an agreement/possible-match means the reviewer sees a conflict
+        "supported": "contradicted",
+        "possible_match": "contradicted",
+        "agree": "contradicted",
+        # disagree on a conflict means the reviewer thinks the claims actually agree
+        "contradicted": "supported",
+        "possible_conflict": "supported",
+    },
+    # a "fix" marks the pair a false positive (same name, different concept)
+    "fix": "definition_mismatch",
+}
+
+
+def apply_human_verdict(link_id: int, decision: str) -> dict | None:
+    """Override a link's verdict from a human review (Q1). Writes an SVT row and
+    stamps ``verdict_source='human'`` with full confidence, so later machine
+    regrades leave it alone. Returns {id, before, after, changed} or None if the
+    link does not exist.
+    """
+    row = query_one(
+        "SELECT id, verdict, verdict_source FROM claim_links WHERE id = %s", (link_id,))
+    if not row:
+        return None
+    before = row["verdict"]
+    if decision == "agree":
+        after = before  # reviewer confirms the current machine verdict
+    elif decision == "disagree":
+        # Only flip verdicts we have a clear opposite for; leave others as-is
+        # rather than inventing a verdict (e.g. 'unmatched' has nothing to
+        # disagree with).
+        after = HUMAN_DECISION_VERDICT["disagree"].get(before)
+        if after is None:
+            return {"id": link_id, "before": before, "after": before, "changed": False}
+    elif decision == "fix":
+        after = HUMAN_DECISION_VERDICT["fix"]
+    else:
+        return {"id": link_id, "before": before, "after": before, "changed": False}
+    # Skip a true no-op: an already-human link with the same verdict needs no
+    # new SVT row (the override is already in force).
+    if after == before and row["verdict_source"] == SOURCE_HUMAN:
+        return {"id": link_id, "before": before, "after": after, "changed": False}
+    execute(
+        """UPDATE claim_links
+           SET verdict = %s, verdict_source = %s, verdict_confidence = %s,
+               rationale = %s, computed_at = CURRENT_TIMESTAMP
+           WHERE id = %s""",
+        (after, SOURCE_HUMAN, 1.0, f"human review: {decision}", link_id),
+    )
+    return {"id": link_id, "before": before, "after": after,
+            "changed": before != after}

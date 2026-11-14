@@ -32,7 +32,10 @@ function normaliseUrl(value, field) {
 
 function originPattern(apiBase) {
   const url = new URL(apiBase);
-  return `${url.protocol}//${url.hostname}/*`;
+  // Keep the port: Chrome match patterns treat "http://localhost/*" as port 80
+  // only, so a dev API on :8000 would be unreachable. "http://localhost:8000/*"
+  // (or :* in the manifest) is what actually grants the fetch.
+  return `${url.protocol}//${url.host}/*`;
 }
 
 chrome.storage.sync.get(defaults, (cfg) => {

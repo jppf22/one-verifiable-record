@@ -303,6 +303,7 @@ def _annotation_link(link: dict, claim_ids: set[int]) -> dict:
         "evidence": link.get("evidence") or "",
         "rationale": link.get("rationale") or "",
         "confidence": link.get("candidate_confidence"),
+        "verdict_confidence": link.get("verdict_confidence"),
         "similarity": link.get("similarity"),
         "local": link.get("claim_a") in claim_ids or link.get("claim_b") in claim_ids,
     }
@@ -423,6 +424,7 @@ class Review(BaseModel):
     reviewer: str
     decision: str  # agree | disagree | fix
     note: Optional[str] = None
+    override: bool = False  # Q1: apply the decision as the machine verdict
 
 
 @app.post("/api/reviews")
@@ -443,10 +445,16 @@ def create_review(r: Review):
         "VALUES (%s, %s, %s, %s)",
         (r.claim_link_id, r.reviewer, r.decision, r.note),
     )
-    # The review does not overwrite the machine verdict: re-check the page of
-    # claim_a and report whether the conflict resurfaces (assumptions.md, decision 4).
+    # Q1 (assumptions.md): by default the review does not overwrite the machine
+    # verdict — we re-check the page of claim_a and report whether the conflict
+    # resurfaces (decision 4). When override=true, the decision sets the verdict
+    # (verdict_source='human'), and the re-check then runs over the new state.
+    override_result = (
+        verdicts.apply_human_verdict(r.claim_link_id, r.decision) if r.override else None
+    )
     result = recheck.recheck_page(link["page_id"], [r.claim_link_id])
-    return {"ok": True, "review_id": review_id, "recheck": result}
+    return {"ok": True, "review_id": review_id, "override": override_result,
+            "recheck": result}
 
 
 @app.get("/api/reviews")

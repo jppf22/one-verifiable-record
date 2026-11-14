@@ -32,6 +32,7 @@ web/
     ├── search.js       # Search functionality
     ├── merge.js        # Merge view (core comparison display)
     ├── review.js       # Review UI (Agree/Disagree/Fix)
+    ├── consensus.js    # Review consensus policy R1 (display only, docs/review-consensus.md)
     ├── keyboard.js     # Keyboard shortcuts (j/k, a/d/f, h, ?)
     ├── history.js      # SVT timeline ("biography of a claim")
     ├── suggestions.js  # Patch export (Copy, Download .wiki)

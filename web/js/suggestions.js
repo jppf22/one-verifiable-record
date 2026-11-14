@@ -105,7 +105,9 @@ function card(d) {
         <button type="button" class="sg-copy">Copy</button>
         <button type="button" class="sg-download">Download .wiki</button>
         ${editUrl ? `<a class="sg-edit button" href="${esc(editUrl)}" target="_blank" rel="noopener noreferrer"
-            title="Opens Wikipedia's editor in a new tab. Nothing is submitted for you.">Open edit page on Wikipedia ↗</a>` : ""}
+            title="${d.patch_type === "talk_page"
+              ? "Opens a new talk-page section in Wikipedia's editor (prefilled on en). Nothing is submitted for you."
+              : "Opens Wikipedia's editor with an edit summary filled in. Copy the draft first: Wikipedia can't prefill an existing page. Nothing is submitted for you."}">Open edit page on Wikipedia ↗</a>` : ""}
         <button type="button" class="sg-export${done ? "" : " primary"}" ${done ? "disabled" : ""}>
           ${done ? "Exported ✓" : "Mark exported"}</button>
       </div>
@@ -116,12 +118,34 @@ function card(d) {
 const rank = (order, v) => { const i = order.indexOf(v); return i < 0 ? order.length : i; };
 const titleFor = (d) => d.title || state.titles[d.lang] || "";
 
+/* Preloading text into an existing page is not possible in MediaWiki; only a new section
+ * can be prefilled. en.wikipedia has Template:Preload_wikitext (body "$1") for that, so a
+ * talk-page draft opens fully prefilled there. fi/sv get the heading only (no verified
+ * equivalent template). Article edits get a prefilled edit summary. The human still
+ * reviews and saves. See docs/review-consensus.md ("Applying fixes"). */
+const PRELOAD_TEMPLATE = { en: "Template:Preload_wikitext" };
+const MAX_PRELOAD_CHARS = 1800; // keep the URL well under common length limits
+
+function splitHeading(text) {
+  const m = /^==\s*(.+?)\s*==\s*\n?/.exec(text);
+  return m ? { heading: m[1], body: text.slice(m[0].length) } : { heading: "", body: text };
+}
+
 function editLink(d) {
   const title = titleFor(d);
   if (!title || !/^[a-z-]{2,12}$/.test(d.lang || "")) return null;
-  const section = d.patch_type === "talk_page" ? `Talk:${title}` : title;
-  return `https://${d.lang}.wikipedia.org/w/index.php?title=${encodeURIComponent(section.replace(/ /g, "_"))}&action=edit`
-    + (d.patch_type === "talk_page" ? "&section=new" : "");
+  const base = `https://${d.lang}.wikipedia.org/w/index.php`;
+  if (d.patch_type === "talk_page") {
+    const { heading, body } = splitHeading(String(d.wikitext ?? ""));
+    const q = new URLSearchParams({ title: `Talk:${title}`.replace(/ /g, "_"), action: "edit", section: "new" });
+    if (heading) q.set("preloadtitle", heading);
+    const tpl = PRELOAD_TEMPLATE[d.lang];
+    if (tpl && body && body.length <= MAX_PRELOAD_CHARS) { q.set("preload", tpl); q.append("preloadparams[]", body); }
+    return `${base}?${q}`;
+  }
+  const q = new URLSearchParams({ title: title.replace(/ /g, "_"), action: "edit",
+    summary: `Cross-language consistency fix (One Verifiable Record draft #${d.id}); see talk page` });
+  return `${base}?${q}`;
 }
 
 /* ---------- actions ---------- */

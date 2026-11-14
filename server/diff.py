@@ -51,8 +51,8 @@ def _fetch_links(ids):
     frag, params = in_list(ids)
     return query(
         f"""SELECT cl.id, cl.claim_a, cl.claim_b, cl.verdict, cl.relation,
-                   cl.candidate_confidence, cl.verdict_source, cl.similarity,
-                   cl.evidence, cl.rationale, cl.computed_at
+                   cl.candidate_confidence, cl.verdict_confidence, cl.verdict_source,
+                   cl.similarity, cl.evidence, cl.rationale, cl.computed_at
             FROM claim_links cl
             JOIN claims ca ON ca.id = cl.claim_a
             JOIN claims cb ON cb.id = cl.claim_b

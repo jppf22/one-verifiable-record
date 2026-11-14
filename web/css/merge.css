@@ -189,10 +189,46 @@
 .review-stamp.fix .stamp-icon { color: var(--warn); }
 .review-stamp.optimistic { border-style: dashed; }
 .review-note { flex-basis: 100%; color: var(--muted); font-style: italic; }
+.review-actions .link-btn { font-size: 12px; }
 .fix-form { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; max-width: 640px; }
 .fix-form textarea { width: 100%; resize: vertical; }
 .fix-actions { display: flex; gap: 6px; }
 .fix-actions button { padding: 5px 12px; font-size: 13px; }
+.fix-actions { align-items: center; flex-wrap: wrap; }
+.fix-actions .muted { font-size: 12px; }
+.decision-pick { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; border: 0; }
+.decision-opt {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--border-subtle); border-radius: var(--radius); background: var(--paper);
+}
+.decision-opt input { margin: 0; accent-color: var(--accent); }
+.decision-opt:has(input:checked) { border-color: var(--accent); background: var(--accent-quiet); }
+.decision-opt.agree:has(input:checked) { border-color: var(--ok); background: var(--ok-bg); }
+.decision-opt.disagree:has(input:checked) { border-color: var(--bad); background: var(--bad-bg); }
+.decision-opt.fix:has(input:checked) { border-color: var(--warn); background: var(--warn-bg); }
+
+/* ---------- review consensus (policy R1, display only) ---------- */
+.consensus-slot:empty { display: none; }
+.consensus { margin: 0 0 6px; font-size: 12px; width: fit-content; max-width: 100%; }
+.consensus summary { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; cursor: pointer; color: var(--muted); }
+.consensus-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+.consensus.ok summary { color: var(--ok); } .consensus.ok .consensus-dot { background: var(--ok); }
+.consensus.bad summary { color: var(--bad); } .consensus.bad .consensus-dot { background: var(--bad); }
+.consensus.warn summary { color: var(--warn); } .consensus.warn .consensus-dot { background: var(--warn); }
+.consensus.pending .consensus-dot { background: transparent; border: 1px solid var(--muted); }
+.consensus .votes { margin: 4px 0 0; padding-left: 18px; display: grid; gap: 2px; }
+.consensus .votes li { overflow-wrap: anywhere; }
+.consensus .votes li.stale { opacity: .7; text-decoration: line-through; text-decoration-color: var(--border); }
+.consensus .votes q { display: block; color: var(--muted); font-style: italic; }
+.consensus-policy { margin: 4px 0 0; font-size: 11px; }
+.consensus-policy code { font-size: 11px; }
+
+/* receipt facts grid (drawer) */
+.receipt-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 0; font-size: 12px; }
+.receipt-facts > div { display: flex; gap: 4px; }
+.receipt-facts dt { color: var(--muted); }
+.receipt-facts dd { margin: 0; font-family: ui-monospace, monospace; }
+.source-tag.deterministic-fallback { color: var(--warn); border-color: var(--warn); border-style: dashed; }
 
 /* ---------- re-check banner ---------- */
 #recheck-banner {

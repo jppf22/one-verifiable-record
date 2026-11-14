@@ -6,10 +6,11 @@
  * Bus: emits page:loaded, history:open, recheck:done (manual); handles recheck:done
  * and page:reload. */
 import { api } from "./api.js";
-import { $, $$, esc, toast, fmtTime, wikiUrl, safeUrl, pageRevUrl, sortByLang, LANG_NAMES } from "./util.js";
+import { $, $$, esc, toast, fmtTime, wikiUrl, safeUrl, pageRevUrl, sortByLang, LANG_NAMES, debounce } from "./util.js";
 import { on, emit } from "./bus.js";
 import { replaceQuery, pageHref } from "./router.js";
 import * as reviewUi from "./review.js";
+import * as consensus from "./consensus.js";
 
 export const STATUS = {
   conflict: { label: "Conflict", plural: "conflicts", one: "conflict" },
@@ -32,6 +33,10 @@ const VERDICT_CLASS = {
   contradicted: "bad", possible_conflict: "warn", possible_match: "warn",
   supported: "ok", definition_mismatch: "warn", unverifiable: "warn",
 };
+const SOURCE_LABEL = { "deterministic-fallback": "rules (LLM unavailable)" };
+const sourceLabel = (s) => SOURCE_LABEL[s] || s || "unknown";
+const fmtNum = (x, d = 2) => (x != null && x !== "" && !isNaN(Number(x)) ? Number(x).toFixed(d) : null);
+const GAP_STATUSES = new Set(["missing_here", "only_here"]);
 const SIM_TOOLTIP = "Similarity = 1 − cosine distance via MariaDB VEC_DISTANCE_COSINE over an HNSW index";
 const RECHECK_KEY = (pageId) => `ovr.recheck.page.${pageId}`;
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -109,12 +114,12 @@ function claimUrl(cl) { return safeUrl(cl.url) || safeUrl(wikiUrl(cl.lang, cl.re
 export function currentPageId() { return state.pageId; }
 export function getLink(id) { return state.linkIndex.get(Number(id))?.link || null; }
 
-function visibleCards() { return $$("#rows .row-card[data-key]"); }
+function visibleCards() { return $$("#rows .row-card[data-key]:not([hidden])"); }
 
 export function focusRow(key, { scroll = true } = {}) {
   const card = key && $(`#rows .row-card[data-key="${CSS.escape(key)}"]`);
   $$("#rows .row-card.is-focused").forEach((c) => c.classList.remove("is-focused"));
-  if (!card) { state.focusedKey = null; return; }
+  if (!card || card.hidden) { state.focusedKey = null; return; }
   state.focusedKey = key;
   card.classList.add("is-focused");
   card.focus({ preventScroll: true });
@@ -123,12 +128,29 @@ export function focusRow(key, { scroll = true } = {}) {
 
 /** Apply a shareable ?focus=r-{claim-id} without consuming it from the URL. */
 function applyQueryFocus(query) {
+  const wantPanel = query?.get("panel") || "";
   const key = query?.get("focus") || "";
+  if (wantPanel === "suggestions") {
+    // Extension "Draft a patch" deep link: reveal the export-only suggestions
+    // panel. It never generates or applies anything on its own.
+    requestAnimationFrame(() => {
+      const panel = $("#suggestions");
+      if (panel) panel.scrollIntoView({ block: "start", behavior: reducedMotion() ? "auto" : "smooth" });
+    });
+  }
   if (!/^r-\d+$/.test(key)) return;
+  const wantReview = query?.get("review") === "1";
   // Rows must exist before they can receive the same focused state used by
   // keyboard navigation. The parameter stays intact for shareable links.
   requestAnimationFrame(() => {
-    if (state.data && (state.data.rows || []).some((r) => r.key === key)) focusRow(key);
+    if (!state.data || !(state.data.rows || []).some((r) => r.key === key)) return;
+    focusRow(key);
+    // Extension "Review this claim" deep link: move the reviewer straight to
+    // the row's first review control. Never submits anything on its own.
+    if (!wantReview) return;
+    const card = $(`#rows .row-card[data-key="${CSS.escape(key)}"]`);
+    const control = card?.querySelector(".review-actions button[data-review]");
+    if (control) control.focus({ preventScroll: true });
   });
 }
 
@@ -138,6 +160,37 @@ export function moveFocus(delta) {
   const idx = cards.findIndex((c) => c.dataset.key === state.focusedKey);
   const next = idx < 0 ? (delta > 0 ? 0 : cards.length - 1) : Math.max(0, Math.min(cards.length - 1, idx + delta));
   focusRow(cards[next].dataset.key);
+}
+
+const STATUS_GROUPS = {
+  conflict: ["conflict", "possible_conflict"],
+  gap: ["missing_here", "only_here"],
+  agree: ["agree", "possible_match"],
+};
+
+/** Move to the next/previous visible row in a status group (wraps). Returns false if none. */
+export function moveFocusToGroup(group, delta) {
+  const want = new Set(STATUS_GROUPS[group] || []);
+  const cards = visibleCards();
+  const n = cards.length;
+  if (!n) return false;
+  const idx = cards.findIndex((c) => c.dataset.key === state.focusedKey);
+  for (let step = 1; step <= n; step++) {
+    const i = (((idx < 0 ? (delta > 0 ? -1 : 0) : idx) + delta * step) % n + n) % n;
+    const r = rowByKey(cards[i].dataset.key);
+    if (r && want.has(r.status)) { focusRow(r.key); return true; }
+  }
+  return false;
+}
+
+function rowByKey(key) { return (state.data?.rows || []).find((r) => r.key === key) || null; }
+
+/** Toggle the receipts of the focused row's first unreviewed (else first) verdict. */
+export function toggleFocusedReceipts() {
+  const r = focusedRow();
+  const link = r && (firstUnreviewedLink(r) || gradedLinks(r)[0]);
+  if (link) toggleDrawer(link.id);
+  return Boolean(link);
 }
 
 /** The focused row object (or null). */
@@ -290,12 +343,20 @@ function passes(r) {
   if (f.statuses.size && !f.statuses.has(r.status)) return false;
   if (f.kinds.size && !rowKinds(r).some((k) => f.kinds.has(k))) return false;
   if (f.unreviewed && !firstUnreviewedLink(r)) return false;
-  if (f.text.trim()) {
-    const t = f.text.trim().toLowerCase();
-    const hay = [r.predicate, ...rowClaims(r).flatMap((cl) => [cl.statement_text, cl.value_text, cl.predicate])];
-    if (!hay.some((x) => String(x || "").toLowerCase().includes(t))) return false;
-  }
+  if (f.text.trim() && !haystack(r).includes(f.text.trim().toLowerCase())) return false;
   return true;
+}
+
+const hayCache = new WeakMap();
+/** Lower-cased predicate, value and statement text of a row (cached per payload row). */
+function haystack(r) {
+  let h = hayCache.get(r);
+  if (h == null) {
+    h = [r.predicate, ...rowClaims(r).flatMap((cl) => [cl.statement_text, cl.value_text, cl.predicate])]
+      .filter(Boolean).map((x) => humanise(x).toLowerCase() + "\u0001" + String(x).toLowerCase()).join("\u0002");
+    hayCache.set(r, h);
+  }
+  return h;
 }
 
 function filtersActive() {
@@ -307,9 +368,14 @@ function toggleStatus(s) {
   const set = state.filters.statuses;
   set.has(s) ? set.delete(s) : set.add(s);
   persistFilters();
+  refilter();
+}
+
+/** Filters changed: update the meter, the filter bar and row visibility. No row re-render. */
+function refilter() {
   renderSummary();
-  renderFilters();
-  renderRows();
+  syncFilterUi();
+  applyVisibility();
 }
 
 /* ---------------- rendering ---------------- */
@@ -414,9 +480,22 @@ function renderFilters() {
       <input id="filter-text" type="search" placeholder="Filter statements, values, predicates…" value="${esc(f.text)}" aria-label="Filter by statement text">
       <label class="toggle"><input type="checkbox" id="filter-unreviewed" ${f.unreviewed ? "checked" : ""}> Only unreviewed</label>
       <span class="muted filter-count" role="status">Showing ${shown} of ${(d.rows || []).length} rows</span>
-      ${filtersActive() ? `<button type="button" class="link-btn" data-action="clear-filters">Clear filters</button>` : ""}
+      <button type="button" class="link-btn" data-action="clear-filters" ${filtersActive() ? "" : "hidden"}>Clear filters</button>
     </div>`;
   if (hadFocus) { const inp = $("#filter-text"); inp.focus(); inp.setSelectionRange(caret, caret); }
+}
+
+/** Sync chip state, the clear button and the count without rebuilding the bar (keeps focus). */
+function syncFilterUi() {
+  const f = state.filters;
+  for (const c of $$("#filters [data-status]")) c.setAttribute("aria-pressed", String(f.statuses.has(c.dataset.status)));
+  for (const c of $$("#filters [data-kind]")) c.setAttribute("aria-pressed", String(f.kinds.has(c.dataset.kind)));
+  const clear = $("#filters [data-action=clear-filters]");
+  if (clear) clear.hidden = !filtersActive();
+  const box = $("#filter-text");
+  if (box && box.value !== f.text) box.value = f.text;
+  const un = $("#filter-unreviewed");
+  if (un) un.checked = f.unreviewed;
 }
 
 function claimCell(cl) {
@@ -448,7 +527,8 @@ function diffHtml(r, cpLangs) {
       <div class="diff-col here" data-lang="${esc(hl)}">
         <div class="col-head"><span class="lang-tag">${esc(hl)}</span> this page</div>
         ${here.length ? here.map(claimCell).join("")
-          : missingCell("Not on this page", r.status === "missing_here" ? "tone-missing" : "tone-muted")}
+          : missingCell(r.status === "missing_here" ? `Not on this page · stated on ${statedOn(r, cpLangs)}` : "Not on this page",
+              r.status === "missing_here" ? "tone-missing" : "tone-muted")}
       </div>`;
   const right = cpLangs.map((lang) => {
     const claims = (r.there || {})[lang] || [];
@@ -460,6 +540,11 @@ function diffHtml(r, cpLangs) {
       </div>`;
   }).join("");
   return left + right;
+}
+
+function statedOn(r, cpLangs) {
+  const ls = cpLangs.filter((l) => ((r.there || {})[l] || []).length);
+  return ls.length ? ls.join(", ") : "a counterpart page";
 }
 
 /** Short explanation next to the row badge, from this page's point of view. */
@@ -515,10 +600,15 @@ function evidenceHtml(link) {
   return `<div class="receipts">
       <h4>Evidence</h4>${passages}
       <div class="receipt-links">${revLinks}</div>
-      <p class="muted receipt-meta">Link #${esc(link.id)} · similarity ${link.similarity != null ? esc(Number(link.similarity).toFixed(3)) : "n/a"}
-        · semantic confidence ${link.candidate_confidence != null ? esc(Number(link.candidate_confidence).toFixed(2)) : "n/a"}
-        · relation ${esc(link.relation || "unknown")}
-        · computed ${esc(fmtTime(link.computed_at))} · source ${esc(link.verdict_source || "unknown")}</p>
+      <dl class="receipt-facts">
+        <div><dt>Link</dt><dd>#${esc(link.id)}</dd></div>
+        <div><dt title="${esc(SIM_TOOLTIP)}">Similarity</dt><dd>${esc(fmtNum(link.similarity, 3) ?? "n/a")}</dd></div>
+        <div><dt title="Combined: vector similarity, predicate match and grading-layer certainty">Verdict confidence</dt><dd>${esc(fmtNum(link.verdict_confidence) ?? "n/a")}</dd></div>
+        <div><dt>Semantic confidence</dt><dd>${esc(fmtNum(link.candidate_confidence) ?? "n/a")}</dd></div>
+        <div><dt>Relation</dt><dd>${esc(link.relation || "unknown")}</dd></div>
+        <div><dt>Graded by</dt><dd>${esc(sourceLabel(link.verdict_source))}</dd></div>
+        <div><dt>Computed</dt><dd>${esc(fmtTime(link.computed_at))}</dd></div>
+      </dl>
     </div>`;
 }
 
@@ -536,15 +626,16 @@ function verdictRow(link) {
   const cls = VERDICT_CLASS[link.verdict] || "warn";
   const sim = link.similarity != null
     ? `<span class="sim" title="${esc(SIM_TOOLTIP)}">sim ${esc(Number(link.similarity).toFixed(2))}</span>` : "";
-  const semantic = link.candidate_confidence != null
-    ? `<span class="sim" title="Semantic verdict confidence">conf ${esc(Number(link.candidate_confidence).toFixed(2))}</span>` : "";
+  const confVal = link.verdict_confidence ?? link.candidate_confidence;
+  const semantic = fmtNum(confVal) != null
+    ? `<span class="sim" title="${link.verdict_confidence != null ? "Verdict confidence (similarity + predicate match + layer certainty)" : "Semantic verdict confidence"}">conf ${esc(fmtNum(confVal))}</span>` : "";
   const open = state.openDrawers.has(Number(link.id));
   const drawerId = `receipts-${esc(link.id)}`;
   return `<div class="verdict-row ${cls}" data-link-id="${esc(link.id)}">
       <div class="verdict-head">
         <span class="verdict-badge ${cls}">${esc(humanise(link.verdict))}</span>
         <span class="pair">${pairLabel(link)}</span>
-        <span class="source-tag ${esc(link.verdict_source)}">${esc(link.verdict_source || "unknown")}</span>
+        <span class="source-tag ${esc(link.verdict_source)}">${esc(sourceLabel(link.verdict_source))}</span>
         ${link.review ? `<span class="source-tag human" title="A human reviewed this verdict">human-reviewed</span>` : ""}
         ${sim}
         ${semantic}
@@ -592,7 +683,6 @@ function renderRows() {
   host.removeAttribute("aria-busy");
   const cpLangs = counterpartLangs(d);
   const all = d.rows || [];
-  const shown = all.filter(passes);
   if (!(d.counterparts || []).length) {
     host.innerHTML = `<div class="empty-state"><p><b>This page has no counterpart pages.</b></p>
       <p class="muted">There is nothing to compare it with: no page in another language links to it.</p>
@@ -604,13 +694,33 @@ function renderRows() {
       <p class="muted">Import this page and its counterparts, then re-check the page.</p></div>`;
     return;
   }
-  if (!shown.length) {
-    host.innerHTML = `<div class="empty-state"><p>No rows match the current filters.</p>
+  // Every row is rendered once per payload; filters only toggle [hidden] (fast on 100+ rows).
+  host.innerHTML = legendHtml(cpLangs) + all.map((r) => rowCard(r, cpLangs)).join("") +
+    `<div class="empty-state" id="rows-nomatch" hidden><p>No rows match the current filters.</p>
       <button type="button" data-action="clear-filters">Clear filters</button></div>`;
-    return;
+  applyVisibility();
+}
+
+/** Show the rows that pass the filters; returns the number shown. */
+function applyVisibility() {
+  const d = state.data;
+  if (!d) return 0;
+  const byKey = new Map((d.rows || []).map((r) => [r.key, r]));
+  let shown = 0;
+  for (const card of $$("#rows .row-card[data-key]")) {
+    const ok = passes(byKey.get(card.dataset.key) || {});
+    if (card.hidden === ok) card.hidden = !ok;
+    if (ok) shown++;
   }
-  host.innerHTML = legendHtml(cpLangs) + shown.map((r) => rowCard(r, cpLangs)).join("");
-  if (state.focusedKey && !shown.some((r) => r.key === state.focusedKey)) state.focusedKey = null;
+  const none = $("#rows-nomatch");
+  if (none) none.hidden = shown > 0;
+  const legend = $("#rows .diff-legend");
+  if (legend) legend.hidden = shown === 0;
+  const count = $("#filters .filter-count");
+  if (count) count.textContent = `Showing ${shown} of ${(d.rows || []).length} rows`;
+  if (state.focusedKey && $(`#rows .row-card[data-key="${CSS.escape(state.focusedKey)}"]`)?.hidden) focusRow(null);
+  consensus.hydrate($("#rows"), getLink);
+  return shown;
 }
 
 function toggleDrawer(linkId) {
@@ -772,14 +882,14 @@ export function init() {
     if (action === "retry") { const r = state.route; state.routeKey = null; open(r); return; }
     if (action === "recheck") { recheckNow(); return; }
     if (action === "dismiss-banner") { hideBanner(); sessionStorage.removeItem(RECHECK_KEY(state.pageId)); return; }
-    if (action === "clear-filters") { resetFilters(); renderSummary(); renderFilters(); renderRows(); return; }
+    if (action === "clear-filters") { resetFilters(); refilter(); return; }
     const status = t.closest("[data-status]")?.dataset.status;
     if (status && t.closest("#summary-bar, #filters")) { toggleStatus(status); return; }
     const kind = t.closest("[data-kind]")?.dataset.kind;
     if (kind) {
       const k = state.filters.kinds;
       k.has(kind) ? k.delete(kind) : k.add(kind);
-      renderFilters(); renderRows(); return;
+      refilter(); return;
     }
     const hist = t.closest("[data-history]");
     if (hist) { emit("history:open", { claimId: Number(hist.dataset.history) }); return; }
@@ -788,7 +898,8 @@ export function init() {
     const go = t.closest("[data-goto-row]");
     if (go) {
       const key = go.dataset.gotoRow;
-      if (!$(`#rows .row-card[data-key="${CSS.escape(key)}"]`)) { resetFilters(); renderAll(); }
+      const target = $(`#rows .row-card[data-key="${CSS.escape(key)}"]`);
+      if (!target || target.hidden) { resetFilters(); refilter(); }
       focusRow(key);
       return;
     }
@@ -797,17 +908,15 @@ export function init() {
     if (card && !t.closest("a, button, input, textarea, label, form")) focusRow(card.dataset.key, { scroll: false });
   });
 
+  // Debounced: the filter bar is not rebuilt, so focus and caret stay in the text box.
+  const onText = debounce(() => { syncFilterUi(); applyVisibility(); }, 150);
   view.addEventListener("input", (e) => {
-    if (e.target.id === "filter-text") {
-      state.filters.text = e.target.value;
-      renderFilters(); // keeps focus + caret in the text box
-      renderRows();
-    }
+    if (e.target.id === "filter-text") { state.filters.text = e.target.value; onText(); }
   });
   view.addEventListener("change", (e) => {
     if (e.target.id === "filter-unreviewed") {
       state.filters.unreviewed = e.target.checked;
-      renderFilters(); renderRows();
+      refilter();
     }
   });
 }

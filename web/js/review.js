@@ -5,6 +5,7 @@
 import { api } from "./api.js";
 import { $, esc, toast, ensureReviewer, fmtTime } from "./util.js";
 import { emit } from "./bus.js";
+import * as consensus from "./consensus.js";
 
 const DECISIONS = {
   agree: { label: "Agree", icon: "✓", hint: "The machine verdict is right" },
@@ -32,7 +33,7 @@ export function stampHtml(review, { optimistic = false } = {}) {
     </div>`;
 }
 
-/** Review controls for one verdict row (link). */
+/** Review controls for one verdict row (link). The note form is built on demand. */
 export function controlsHtml(link) {
   const busy = isPending(link.id);
   const buttons = Object.entries(DECISIONS).map(([key, d]) =>
@@ -41,19 +42,40 @@ export function controlsHtml(link) {
        <span aria-hidden="true">${d.icon}</span> ${d.label}</button>`).join("");
   return `<div class="review" data-review-for="${esc(link.id)}">
       <div class="review-stamp-slot">${stampHtml(link.review, { optimistic: busy })}</div>
+      <div class="consensus-slot" data-link-id="${esc(link.id)}"></div>
       <div class="review-actions" role="group" aria-label="Review this verdict">
         <span class="muted review-label">${link.review ? "Review again:" : "Your review:"}</span>${buttons}
+        <button type="button" class="link-btn" data-review-note="${esc(link.id)}"
+          title="Review with a note (key: n)" ${busy ? "disabled" : ""}>+ note</button>
       </div>
-      <form class="fix-form" data-link-id="${esc(link.id)}" hidden>
-        <label class="sr-only" for="fix-note-${esc(link.id)}">Describe the fix</label>
-        <textarea id="fix-note-${esc(link.id)}" name="note" rows="2" required maxlength="2000"
-          placeholder="What is wrong, and what should the sentence say? (required)"></textarea>
-        <div class="fix-actions">
-          <button type="submit" class="primary">Submit fix</button>
-          <button type="button" data-fix-cancel>Cancel</button>
-        </div>
-      </form>
     </div>`;
+}
+
+function formHtml(linkId, decision) {
+  const id = esc(linkId);
+  const radios = Object.entries(DECISIONS).map(([key, d]) =>
+    `<label class="decision-opt ${key}"><input type="radio" name="decision" value="${key}" ${key === decision ? "checked" : ""}>
+       <span aria-hidden="true">${d.icon}</span> ${d.label}</label>`).join("");
+  return `<form class="fix-form" data-link-id="${id}">
+      <fieldset class="decision-pick"><legend class="sr-only">Decision</legend>${radios}</fieldset>
+      <label class="sr-only" for="fix-note-${id}">Note</label>
+      <textarea id="fix-note-${id}" name="note" rows="2" maxlength="2000"></textarea>
+      <div class="fix-actions">
+        <button type="submit" class="primary">Submit review</button>
+        <button type="button" data-fix-cancel>Cancel</button>
+        <span class="muted">Ctrl+Enter submits · Esc cancels</span>
+      </div>
+    </form>`;
+}
+
+function syncForm(form) {
+  const decision = form.querySelector("input[name=decision]:checked")?.value || "fix";
+  const ta = form.querySelector("textarea");
+  ta.required = decision === "fix";
+  ta.placeholder = decision === "fix"
+    ? "What is wrong on the page, and what should it say? Cite a non-Wikipedia source if you have one. (required)"
+    : "Optional note for other reviewers";
+  form.querySelector("button[type=submit]").textContent = `Submit ${DECISIONS[decision].label.toLowerCase()}`;
 }
 
 function rowEl(linkId) { return $(`.review[data-review-for="${CSS.escape(String(linkId))}"]`); }
@@ -70,17 +92,21 @@ function setStamp(linkId, review, optimistic) {
   if (slot) slot.innerHTML = stampHtml(review, { optimistic });
 }
 
-export function openFix(linkId) {
-  const form = rowEl(linkId)?.querySelector(".fix-form");
-  if (!form) return;
-  form.hidden = false;
+/** Open the note form for a link, preselecting a decision (Fix needs a note). */
+export function openForm(linkId, decision = "fix") {
+  const host = rowEl(linkId);
+  if (!host || isPending(linkId)) return;
+  let form = host.querySelector(".fix-form");
+  if (!form) { host.insertAdjacentHTML("beforeend", formHtml(linkId, decision)); form = host.querySelector(".fix-form"); }
+  const radio = form.querySelector(`input[value="${decision}"]`);
+  if (radio) radio.checked = true;
+  syncForm(form);
   form.querySelector("textarea").focus();
 }
 
-function closeFix(linkId) {
-  const form = rowEl(linkId)?.querySelector(".fix-form");
-  if (form) { form.hidden = true; form.reset(); }
-}
+export function openFix(linkId) { openForm(linkId, "fix"); }
+
+function closeFix(linkId) { rowEl(linkId)?.querySelector(".fix-form")?.remove(); }
 
 /** Submit a review. Returns true on success. */
 export async function review(linkId, decision, note = "") {
@@ -103,6 +129,7 @@ export async function review(linkId, decision, note = "") {
       claim_link_id: linkId, reviewer, decision, note: note.trim() || undefined,
     });
     if (link) link.review = { id: res.review_id, ...optimistic };
+    consensus.invalidate(linkId);
     pending.delete(linkId);
     setBusy(linkId, false);
     setStamp(linkId, link?.review || optimistic, false);
@@ -131,16 +158,23 @@ export function init() {
       else review(linkId, decision);
       return;
     }
+    const noteBtn = e.target.closest("[data-review-note]");
+    if (noteBtn) { openForm(noteBtn.dataset.reviewNote, "agree"); return; }
     const cancel = e.target.closest("[data-fix-cancel]");
     if (cancel) closeFix(cancel.closest(".fix-form").dataset.linkId);
+  });
+  host.addEventListener("change", (e) => {
+    const form = e.target.closest(".fix-form");
+    if (form && e.target.name === "decision") syncForm(form);
   });
   host.addEventListener("submit", (e) => {
     const form = e.target.closest(".fix-form");
     if (!form) return;
     e.preventDefault();
+    const decision = form.querySelector("input[name=decision]:checked")?.value || "fix";
     const note = form.querySelector("textarea").value;
-    if (!note.trim()) { toast("A note is required for Fix.", "warn"); return; }
-    review(form.dataset.linkId, "fix", note);
+    if (decision === "fix" && !note.trim()) { toast("A note is required for Fix.", "warn"); return; }
+    review(form.dataset.linkId, decision, note);
   });
   host.addEventListener("keydown", (e) => {
     const form = e.target.closest(".fix-form");

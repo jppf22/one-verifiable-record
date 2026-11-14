@@ -74,6 +74,26 @@ Assumed (coordinator):
   badge omits the gaps segment instead of showing "0 gaps". Conflicts fall back to
   `counts.contradicted` (link-level). "Verified" stays link-level `counts.supported`.
   The deep link is hidden if the response has no `qid`.
+- X2. (extension) The inline overlay now marks **every** local claim that has a graded
+  link, grouped by status colour: conflict / possible_conflict / only_here /
+  possible_match / **agree** (soft teal, thin underline for the non-issue case).
+  `/api/extension/annotations` adds `agree` to its annotatable statuses and emits a
+  `kind` field (date/number/quantity/entity_relation/factoid) per annotation, so the
+  overlay can label and group claims by type. `missing_here` stays overlay-only (no
+  local claim to anchor). The badge pill reports "N claims marked (I to check, A agree)".
+- X3. (extension) The marker popover offers three non-editing actions besides the
+  receipts drawer: "Open focused comparison" (`?focus=r-…`), "Review this claim"
+  (`?focus=r-…&review=1`, which focuses the row's first review control in the web app),
+  and "Copy claim" (copies this page's sentence plus counterpart wording to the
+  clipboard for drafting a talk-page note). None of them edit Wikipedia.
+- X4. (extension) For conflict / possible_conflict / missing_here markers the popover
+  also offers "Draft a patch" (`?focus=r-…&panel=suggestions`), which opens the web
+  app's export-only suggestions panel scrolled into view. The revision links are
+  relabelled "Open {lang} on Wikipedia (analysed revision)".
+- X5. (extension) The badge bar adds, when the overlay is on: a "Next conflict (N)"
+  button that cycles focus through conflict/possible_conflict markers (mirrors the
+  web app's `g j`), and per-type filter chips (one per claim `kind` present) that
+  toggle which kinds the overlay paints. An empty selection shows all kinds.
 
 ## Assumed (server)
 - S1. Stale-link detection compares `claims FOR SYSTEM_TIME ALL` `ROW_START` against
@@ -142,10 +162,33 @@ Assumed (coordinator):
 - W6. Only the `status` filter goes into the URL (`?status=conflict,gap`, via replaceState,
   so no extra history entries). The kind, text and unreviewed filters are per-session view state.
 
+## Assumed (merge view polish + review consensus, Agent 2, 2026-11-14)
+See `docs/review-consensus.md` for the research and sources.
+- M1. Rows are rendered once per compare payload. Filters toggle `[hidden]` instead of
+  re-rendering, and the text filter is debounced (150 ms) and doesn't rebuild the filter bar.
+  On the 187-row / 359-link page (fi "Sipilän hallitus") the first render takes about 250 ms
+  including the API call, and a status filter toggle about 2 ms.
+- M2. Review note form: "+ note" (key `n`) opens a form with an Agree/Disagree/Fix choice.
+  The note is required only for Fix. The form is created on demand, so there is no textarea per link.
+- M3. Keyboard: `g j`/`g k` next/previous conflict, `g m` next gap, `g a` next agreeing row
+  (wraps, visible rows only), `o` toggles the focused row's receipts.
+- M4. Receipts show `verdict_confidence` when present (additive field from the backend).
+  `deterministic-fallback` is labelled "rules (LLM unavailable)".
+- M5. **Policy R1 (display only):** one vote per reviewer, 2 confirm / 3 overturn with a
+  lead of 2, otherwise disputed. A vote counts only while the verdict it was cast on is
+  current (SVT history). It is shown on reviewed links, and the server does not enforce it.
+  The UI still never sends `override=true` (decision #4 stands).
+- M6. Patch edit links: article edits prefill `summary=`. en talk notices prefill heading
+  and body through `Template:Preload_wikitext`. fi/sv prefill only the heading.
+
 ## Open questions for the owner
 - Q1. Should a human Disagree/Fix eventually **override** the machine verdict
   (`verdict_source='human'`), or should reviews stay an audit log plus re-check?
-  Today: re-check only (user decision #4, "for now").
+  **Resolved (opt-in): `POST /api/reviews` accepts `override: true`** (default
+  `false`, so existing callers are unchanged). With it, a decision maps to a
+  verdict stamped `verdict_source='human'`, confidence 1.0, and machine regrades
+  no longer touch the link. See V-S10. Without it, behaviour is unchanged
+  (audit log + re-check, user decision #4).
 - Q2. Should the re-check eventually fetch the **live** Wikipedia revision (MediaWiki API)
   so an applied patch can show "Resolved"? Today it uses the DB snapshot (A1), so
   conflicts resurface until a re-import.
@@ -153,6 +196,9 @@ Assumed (coordinator):
   A1): should new revisions **update claims in place**, so SVT keeps the old version
   and the re-check sees them as stale, or be stored as **new articles/claims rows**?
   Updating in place fits the SVT story best.
+- Q4. Adopt R1 server-side and gate the `override=true` path with it? Thresholds OK? (review-consensus.md O1–O2)
+- Q5. `server/patches.py` cites other Wikipedia editions as `<ref>`s, which WP:CIRCULAR
+  forbids. Switch to `claims.citation_urls`, or fall back to a talk-page notice only? (O3)
 
 ## Page-centric rework (2026-11-14, owner away, authorised to proceed)
 User directive: "compare over pages, not entities or topics". Pages must exist in
@@ -222,6 +268,40 @@ User directive: "compare over pages, not entities or topics". Pages must exist i
 - V-S9. The old QID endpoints are removed, not aliased. Note: `extension/content.js` still reads
   `data.qid` from `/api/badge` and links to `#/merge/{qid}`. It needs `#/page/{lang}/{title}`
   (owner of extension/).
+
+## Assumed (server, verdict engine — Agent 1, 2026-11-14)
+- V-S10. **LLM fallback marking** (migration 003 adds enum value): when the
+  Verda API is unavailable (no key) or the request fails, `verdicts.grade_pair`
+  keeps the loose candidate verdict but tags it `verdict_source='deterministic-
+  fallback'` instead of `'llm'`, so a guess is never presented as a model
+  output. Behaviour with a working key is unchanged.
+- V-S11. **Verdict confidence** (`claim_links.verdict_confidence FLOAT NULL`,
+  migration 003): `verdicts.compute_confidence` combines vector similarity
+  (0.35), predicate agreement (0.30: shared Wikidata property = 1.0, equal
+  predicate string = 0.8, missing = 0.3, mismatch = 0.0), and layer certainty
+  (0.35: deterministic/human = 1.0, LLM = its self-reported confidence, fallback
+  = 0.25). Written on every graded UPDATE; NULL for rows graded before the
+  migration. Exposed additively in `/compare` links and the extension link
+  projection (`verdict_confidence`). `candidate_confidence` (the raw similarity
+  slot) is unchanged.
+- V-S12. **Q1 human override** (see Q1): `verdicts.apply_human_verdict` maps a
+  review decision to a verdict — agree keeps the current verdict, disagree flips
+  supported/possible_match↔contradicted (else unverifiable), fix →
+  definition_mismatch — stamps `verdict_source='human'`, confidence 1.0, and a
+  new SVT row. `grade_links` skips any link already `verdict_source='human'`, so
+  recheck/align never revert a human decision. Opt-in via the `override` request
+  field on `POST /api/reviews` (default false).
+- V-S13. **Indexes** (migration 003): `idx_claims_predicate`,
+  `idx_claims_predicate_entity` (the alignment predicate guard and verdict
+  filters). `idx_verdict` on `claim_links(verdict)` already existed. Verified:
+  verdict and predicate filters use the indexes and run sub-millisecond;
+  `/pages/conflicted` and `/compare` are well under 100 ms.
+- V-S14. **Pre-existing bug surfaced, not fixed (out of scope):**
+  `alignment.clean_invalid_links` does a hard `DELETE FROM claim_links`, which
+  raises a FK error (`fk_reviews_link`) when a link being cleaned has a
+  `reviews` row. `POST /api/pages/{id}/align` 500s on such pages. Owner of
+  `alignment.py` should guard the delete (skip reviewed links) or detach
+  reviews first.
 
 ## Assumed (web, page-centric v2)
 - V-W1. Route `#/page/{lang}/{title}` is resolved with `GET /pages/by-title` to a page id, then
