@@ -153,3 +153,107 @@ Assumed (coordinator):
   A1): should new revisions **update claims in place**, so SVT keeps the old version
   and the re-check sees them as stale, or be stored as **new articles/claims rows**?
   Updating in place fits the SVT story best.
+
+## Page-centric rework (2026-11-14, owner away, authorised to proceed)
+User directive: "compare over pages, not entities or topics". Pages must exist in
+≥2 languages, and there must be ≥5 pages with fact conflicts. See `docs/page-contract.md`.
+- V1. The unit of comparison is a **page** (`articles` row). The new `page_links` table holds
+  interlanguage links between pages (both directions, 26,188 rows, 17,431 pages). It is
+  derived once from the dataset's Wikidata ids, which are never shown or used for
+  logic afterwards.
+- V2. Statuses are **relative to the page being viewed**: conflict / missing on this page /
+  only on this page / agree (v1's symmetric "gap" is split into the two directions).
+- V3. **LLM still unavailable** (Verda project not subscribed to any model). Claims for this
+  demo come from `jobs/extract_rules.py` (`model_version='rules-v1'`): birth and death
+  dates parsed from page leads in fi/sv/en. Uncertain dates (c./noin/omkring,
+  old-style calendar notes, "or") are skipped, and only dates that open their segment
+  are used. Pages whose title or lead names an event or period (war, treaty, era,
+  kingdom…) are skipped. `jobs/extract_claims.py` (LLM) stays for when a model is enabled.
+- V4. Result: 10,385 date claims on 6,206 pages. A pre-alignment SQL check found 252
+  counterpart pairs whose dates disagree, on 221 pages. Spot checks look like real
+  cross-edition discrepancies (e.g. Saara-Sofia Sirén born 1985 vs 1986; Tyyne
+  Leivo-Larsson died 1977 vs 1979). Some will be Julian/Gregorian differences on
+  pre-1918 dates the rules couldn't detect (e.g. Snorri Sturluson 22 vs 23 Sept).
+- V5. First extraction pass (looser rules) was wiped before any links existed, including
+  `DELETE HISTORY FROM claims`, so claim timelines don't show the discarded pass.
+- V6. Alignment: e5-large similarities are compressed, so `match_distance` defaults to
+  0.12, and candidate pairs must share the predicate when both have one.
+
+## Assumed (server, page-centric v2)
+- V-S1. One helper, `pages.comparison_set(page_id)` (X + `page_links.page_b`), drives
+  alignment, verdict grading, re-check, diff, suggestions and Q&A. The landing aggregation
+  (`/pages/conflicted`) joins `page_links` in SQL directly, so the source of truth is the same.
+  `wikidata_qid` is not read anywhere in `server/`.
+- V-S2. Alignment runs per (claim of X, counterpart page): the `nearest_k` (3) nearest claims
+  on *each* counterpart, so every counterpart gets candidates. Only X's claims are queried, so
+  a link exists once the page on either side has been aligned. Default `match_distance` is
+  0.12 (e5 similarity >= 0.88). Predicate guard in SQL: when both claims have a predicate,
+  they must be equal.
+- V-S3. Rows: only `supported`/`contradicted` links join claims into a row. `unmatched`
+  (ungraded), `unverifiable` and `definition_mismatch` links do not join claims. They are still
+  listed in `links` on the row of their claim on this page, so the receipts stay visible.
+  An unverifiable pair therefore shows up as `only_here` + `missing_here`.
+- V-S4. Status order of checks: no claim here -> `missing_here` (even if two counterparts
+  contradict each other); any contradicted link in the row -> `conflict` (this includes a
+  counterpart-vs-counterpart contradiction in a row this page takes part in); no counterpart
+  claim -> `only_here`; otherwise `agree`. Row `kind`/`predicate` are the most common non-null
+  value among the row's claims. `summary.links_total` counts graded links in the comparison set.
+- V-S5. `/pages/conflicted` and the `conflicts` in `/pages?q=` are **claim-level SQL counts**,
+  not the row counts of the comparison view, so they can differ slightly from `/compare`:
+  conflicts = claims here with a contradicted link to a counterpart, agree = supported and not
+  contradicted, only_here = claims here with no supported/contradicted link, missing_here =
+  counterpart claims with no such link to this page (the same fact on two counterparts counts
+  twice). Order: conflicts desc, then number of graded links, then title. Every page of a
+  linked set is listed on its own (fi/sv/en of the same subject can all appear).
+  The badge uses the exact comparison view.
+- V-S6. `/pages/by-title` and `/badge` return 404 for pages with no counterpart ("only pages
+  with >=1 counterpart are offered"). `/pages/{id}` still returns such a page with
+  `counterparts: []`. by-title also accepts the URL form (`_` for spaces).
+- V-S7. Suggestions for page X: a correction for each side of every contradicted link between
+  X and a counterpart. Counterpart-vs-counterpart conflicts are drafted from those pages' own
+  views. Each `missing_here` row gives one notice for X, sourced from the first counterpart in
+  fi/sv/en order. Each `only_here` row gives one notice for every counterpart. Every page in the
+  set gets one talk-page draft. Dedupe stays exact-match on (page, type, wikitext).
+  `drafts` lists the newest 200 drafts across the comparison set, each with `page_id`.
+- V-S8. Export always re-checks the draft's page (focus = its link, if any), so drafts without
+  a link also return a RecheckResult (v1 returned `null`). The review re-check runs on the page
+  of `claim_a`. A focus link's `before` falls back to its pre-regrade verdict if the link is
+  outside that page's set.
+- V-S9. The old QID endpoints are removed, not aliased. Note: `extension/content.js` still reads
+  `data.qid` from `/api/badge` and links to `#/merge/{qid}`. It needs `#/page/{lang}/{title}`
+  (owner of extension/).
+
+## Assumed (web, page-centric v2)
+- V-W1. Route `#/page/{lang}/{title}` is resolved with `GET /pages/by-title` to a page id, then
+  `GET /pages/{id}/compare`. A 404, or a page with zero counterparts, shows "This page can't be
+  compared yet" (no retry). Legacy `?qid=` and `#/merge/…` links (also when typed later) go to `#/`.
+- V-W2. First-open alignment (W1) carries over: if the compare payload has no links or any
+  `unmatched` link, the view calls `POST /pages/{id}/align` once and refetches.
+- V-W3. Bus events renamed: `article:loaded` → `page:loaded {pageId, data}`, `merge:reload` →
+  `page:reload {pageId}`, `recheck:done` carries `pageId` instead of `qid`. The re-check result
+  from a review/export is for the page of claim_a / the draft; the view always reloads the page
+  it is showing when the ids match (otherwise it only caches the result).
+- V-W4. Diff layout: left column = this page, then one column per counterpart language in the
+  payload's `counterparts` order (fi, sv, en), plus any extra language seen in `rows[].there`.
+  Dashed cells: amber "Not on this page" for `missing_here`, blue "Not on the {lang} page" for
+  `only_here`, muted grey for a language that simply lacks the fact in conflict/agree rows.
+  `only_here` uses the accent blue (meter, chips, badge), `missing_here` amber.
+- V-W5. Row headline = humanised `predicate` (row-level, else first claim's) + kind tags + a
+  short note from this page's view ("contradicted by sv, en", "stated on en, not on this page").
+  Claim cells show `predicate: value_text` above the statement. The text filter also matches
+  values and predicates.
+- V-W6. Header switcher: each counterpart card has "Make this page ⇄", a plain link to that
+  page's route (new history entry), so Back returns to the previous point of view.
+- V-W7. Session caches are keyed by page id: `ovr.recheck.page.{id}`, `ovr.qa.page.{id}`.
+  Q&A language select reads "this page only" / "{Language} counterpart only".
+- V-W8. Search shows one result per page (a subject imported in 3 languages yields 3 results,
+  one per point of view) with counterpart chips and its conflict count; rows without
+  counterparts are dropped client-side as well. Typing a QID no longer opens anything.
+- V-W9. Landing "Pages with conflicts" reloads every time the landing is shown, so counts reflect
+  reviews made in the comparison view. Rows with 0 conflicts (server returns them after the
+  conflicted ones) are listed too, with a grey edge instead of red.
+- V-W10. Extension: no badge when `/badge` returns no counterparts. Pill = conflicts / missing
+  here / only here / agree; red if conflicts, amber if only missing-here, else green. Link text
+  "Compare with sv · en" → `${webBase}/#/page/{lang}/{title}` (spaces as `_`).
+- V-W11. Drafts download file names use `{lang}-{title}-{type}-{id}.wiki` instead of the QID;
+  drafts for this page are headed "This page", others "{Language} counterpart".
