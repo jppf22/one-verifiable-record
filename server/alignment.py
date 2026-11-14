@@ -17,7 +17,7 @@ JOIN articles a1 ON a1.id = c1.article_id
 JOIN articles a2 ON a2.wikidata_qid = a1.wikidata_qid AND a2.lang <> a1.lang
 JOIN claims c2 ON c2.article_id = a2.id
 JOIN claim_embeddings e2 ON e2.claim_id = c2.id
-WHERE c1.id = %s
+WHERE c1.id = %s AND c2.revision_id <=> a2.revision_id
 ORDER BY dist ASC
 LIMIT %s
 """
@@ -33,7 +33,7 @@ def align_article(qid: str, k: int | None = None):
     claims = query(
         """SELECT c.id FROM claims c
            JOIN articles a ON a.id = c.article_id
-           WHERE a.wikidata_qid = %s
+           WHERE a.wikidata_qid = %s AND c.revision_id <=> a.revision_id
            ORDER BY c.id""",
         (qid,),
     )

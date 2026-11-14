@@ -19,6 +19,7 @@ CREATE TABLE articles (
   title         VARCHAR(512) NOT NULL,
   wikidata_qid  VARCHAR(16) NULL COMMENT 'e.g. Q9080; NULL if not linked to Wikidata',
   revision_id   BIGINT UNSIGNED NULL,
+  source_hash   CHAR(64) NULL COMMENT 'SHA-256 of the imported source text; detects revision-less refreshes',
   fetched_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uq_lang_page (lang, page_id),
   KEY idx_qid (wikidata_qid),
@@ -26,7 +27,10 @@ CREATE TABLE articles (
 ) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
--- chunks: passage splits of article text. Substrate for RAG retrieval.
+-- chunks: passage splits of article text. Substrate for RAG retrieval. Chunks
+-- are append-only across imports: claims keep pointing at the precise revision
+-- from which they were extracted, while readers query only an article's current
+-- revision.
 -- Embeddings live in chunk_embeddings (see below), written by jobs/embed.py.
 -- ----------------------------------------------------------------------------
 CREATE TABLE chunks (
@@ -37,6 +41,7 @@ CREATE TABLE chunks (
   text         MEDIUMTEXT NOT NULL,
   revision_id  BIGINT UNSIGNED NULL,
   KEY idx_article (article_id),
+  KEY idx_article_revision (article_id, revision_id),
   CONSTRAINT fk_chunks_article FOREIGN KEY (article_id) REFERENCES articles (id)
 ) ENGINE=InnoDB;
 

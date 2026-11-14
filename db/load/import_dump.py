@@ -15,6 +15,12 @@ format-coupled function in the file.
 
 Embeddings are NOT computed here: run ``jobs/embed.py`` afterwards.
 
+Refresh behaviour is append-only. When an imported article's text changes, its
+new chunks are inserted rather than deleting the old chunks that existing
+claims and embeddings reference. Queries only read chunks/claims whose
+revision matches ``articles.revision_id``; old material remains available as
+provenance. Run claim extraction and claim embedding again after a refresh.
+
 Usage:
   python import_dump.py --data-dir db/load/data --size small
 """
@@ -136,28 +142,50 @@ def main():
             digest = hashlib.sha1(f"{lang}:{title}".encode()).hexdigest()
             page_id = int(digest[:12], 16)
         qid = rec.get("qid") or rec.get("wikidata_qid")
+        text = rec.get("text", "")
+        source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        # Decide whether a new source revision needs chunks *before* updating the
+        # article row.  Deleting old chunks is unsafe once claims/embeddings hold
+        # foreign keys to them; retaining them is also what makes their receipts
+        # reproducible after a later import.
+        cur.execute(
+            "SELECT id, revision_id, source_hash FROM articles WHERE lang = %s AND page_id = %s",
+            (lang, page_id),
+        )
+        existing = cur.fetchone()
+        # A new revision id is meaningful even when the text happens to be
+        # identical: receipts must still point to the revision currently
+        # advertised by the article row. Hash comparison covers sources that
+        # do not provide a revision id.
+        changed = (
+            not existing
+            or existing[1] != rec.get("revision_id")
+            or existing[2] != source_hash
+        )
 
         cur.execute(
-            """INSERT INTO articles (lang, page_id, title, wikidata_qid, revision_id)
-               VALUES (%s, %s, %s, %s, %s)
+            """INSERT INTO articles (lang, page_id, title, wikidata_qid, revision_id, source_hash)
+               VALUES (%s, %s, %s, %s, %s, %s)
                ON DUPLICATE KEY UPDATE
                  title = VALUES(title),
                  wikidata_qid = VALUES(wikidata_qid),
-                 revision_id = VALUES(revision_id)""",
-            (lang, page_id, title, qid, rec.get("revision_id")),
+                 revision_id = VALUES(revision_id),
+                 source_hash = VALUES(source_hash),
+                 fetched_at = CURRENT_TIMESTAMP""",
+            (lang, page_id, title, qid, rec.get("revision_id"), source_hash),
         )
         cur.execute("SELECT id FROM articles WHERE lang = %s AND page_id = %s", (lang, page_id))
         (article_id,) = cur.fetchone()
 
-        # re-import is idempotent: replace the article's chunks
-        cur.execute("DELETE FROM chunks WHERE article_id = %s", (article_id,))
-        for idx, chunk in enumerate(split_chunks(rec.get("text", ""))):
-            cur.execute(
-                """INSERT INTO chunks (article_id, chunk_idx, section, text, revision_id)
-                   VALUES (%s, %s, %s, %s, %s)""",
-                (article_id, idx, rec.get("section"), chunk, rec.get("revision_id")),
-            )
-            n_chunks += 1
+        if changed:
+            for idx, chunk in enumerate(split_chunks(text)):
+                cur.execute(
+                    """INSERT INTO chunks (article_id, chunk_idx, section, text, revision_id)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (article_id, idx, rec.get("section"), chunk, rec.get("revision_id")),
+                )
+                n_chunks += 1
         n_articles += 1
 
         if n_articles % 500 == 0:
@@ -166,7 +194,7 @@ def main():
 
     conn.commit()
     print(f"Imported {n_articles} articles, {n_chunks} chunks (preset: {args.size}).")
-    print("Next step: python jobs/embed.py")
+    print("Next step: python jobs/embed.py --tables chunks, then python jobs/extract_claims.py, then python jobs/embed.py --tables claims")
 
 
 if __name__ == "__main__":

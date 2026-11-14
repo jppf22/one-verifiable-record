@@ -21,7 +21,7 @@ def wiki_url(lang, revision_id):
 
 def _fetch_articles(qid: str):
     return query(
-        """SELECT id, lang, title, wikidata_qid, revision_id
+        """SELECT id, lang, title, wikidata_qid, revision_id, fetched_at
            FROM articles WHERE wikidata_qid = %s ORDER BY lang""",
         (qid,),
     )
@@ -33,7 +33,7 @@ def _fetch_claims(qid: str):
                   c.statement_text, c.revision_id, a.lang
            FROM claims c
            JOIN articles a ON a.id = c.article_id
-           WHERE a.wikidata_qid = %s""",
+           WHERE a.wikidata_qid = %s AND c.revision_id <=> a.revision_id""",
         (qid,),
     )
 
@@ -45,7 +45,11 @@ def _fetch_links(qid: str):
            FROM claim_links cl
            JOIN claims c ON c.id = cl.claim_a
            JOIN articles a ON a.id = c.article_id
+           JOIN claims other_c ON other_c.id = cl.claim_b
+           JOIN articles other_a ON other_a.id = other_c.article_id
            WHERE a.wikidata_qid = %s
+             AND c.revision_id <=> a.revision_id
+             AND other_c.revision_id <=> other_a.revision_id
            ORDER BY cl.id""",
         (qid,),
     )
@@ -61,7 +65,11 @@ def _fetch_latest_reviews(qid: str) -> dict:
                  JOIN claim_links cl ON cl.id = r2.claim_link_id
                  JOIN claims c ON c.id = cl.claim_a
                  JOIN articles a ON a.id = c.article_id
+                 JOIN claims other_c ON other_c.id = cl.claim_b
+                 JOIN articles other_a ON other_a.id = other_c.article_id
                  WHERE a.wikidata_qid = %s
+                   AND c.revision_id <=> a.revision_id
+                   AND other_c.revision_id <=> other_a.revision_id
                  GROUP BY r2.claim_link_id) latest ON latest.max_id = r.id""",
         (qid,),
     )

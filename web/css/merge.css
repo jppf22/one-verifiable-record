@@ -3,6 +3,7 @@
 
 /* ---------- header ---------- */
 .merge-title { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.import-time { display: block; margin-top: 8px; font-size: 12px; }
 .merge-title h2 { margin: 16px 0 6px; font-size: 24px; }
 .merge-title .qid { font: 14px ui-monospace, monospace; }
 .merge-actions { padding-top: 16px; }

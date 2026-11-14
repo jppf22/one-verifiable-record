@@ -45,6 +45,8 @@ The excerpt is split into chunks marked [#N]. Reply ONLY with JSON:
 Rules:
 - One fact per claim. Prefer facts another language edition could confirm or contradict:
   dates, years, numbers, places, office holders, memberships, founders, outcomes.
+- The page may be about a person, place, organization, event, creative work, species,
+  or concept. Extract the facts that fit that subject; do not assume it is a biography.
 - "statement": a short self-contained sentence in the SAME LANGUAGE as the excerpt, close to
   the source wording. Resolve pronouns ("he" -> the person's name).
 - "subject": the entity the claim is about, in English (e.g. "Urho Kekkonen").
@@ -83,8 +85,10 @@ def pick_qids(cur, args) -> list:
     sql = """
         SELECT a.wikidata_qid AS qid, MIN(t.len) AS min_len
         FROM articles a
-        JOIN (SELECT article_id, SUM(CHAR_LENGTH(text)) AS len FROM chunks GROUP BY article_id) t
-          ON t.article_id = a.id
+        JOIN (SELECT ch.article_id, SUM(CHAR_LENGTH(ch.text)) AS len
+              FROM chunks ch JOIN articles current_a ON current_a.id = ch.article_id
+              WHERE ch.revision_id <=> current_a.revision_id
+              GROUP BY ch.article_id) t ON t.article_id = a.id
         WHERE a.wikidata_qid IS NOT NULL
         GROUP BY a.wikidata_qid
         HAVING COUNT(DISTINCT a.lang) = 3
@@ -97,7 +101,10 @@ def pick_qids(cur, args) -> list:
 def article_excerpt(cur, article_id: int, max_chars: int):
     chunks = rows(
         cur,
-        "SELECT id, chunk_idx, text FROM chunks WHERE article_id = %s ORDER BY chunk_idx",
+        """SELECT ch.id, ch.chunk_idx, ch.text FROM chunks ch
+           JOIN articles a ON a.id = ch.article_id
+           WHERE ch.article_id = %s AND ch.revision_id <=> a.revision_id
+           ORDER BY ch.chunk_idx""",
         (article_id,),
     )
     picked, used = [], 0
@@ -165,9 +172,13 @@ def extract_article(args, art: dict) -> tuple:
     conn = connect()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM claims WHERE article_id = %s", (art["id"],))
+        cur.execute(
+            """SELECT COUNT(*) FROM claims WHERE article_id = %s
+               AND revision_id <=> %s""",
+            (art["id"], art["revision_id"]),
+        )
         if cur.fetchone()[0]:
-            return art, 0, "skipped (already has claims)"
+            return art, 0, "skipped (current revision already has claims)"
         picked = article_excerpt(cur, art["id"], args.max_chars)
         if not picked:
             return art, 0, "no chunks"

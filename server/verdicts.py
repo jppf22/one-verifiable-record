@@ -187,9 +187,12 @@ def grade_links(pairs, touch_ids=()) -> list:
 
 def grade_unmatched(qid: str) -> list:
     """Grade every 'unmatched' link of this entity. Returns grade_links() results."""
-    return grade_links(
-        fetch_pairs("aa.wikidata_qid = %s AND cl.verdict = 'unmatched'", (qid,))
-    )
+    return grade_links(fetch_pairs(
+        """aa.wikidata_qid = %s AND cl.verdict = 'unmatched'
+           AND ca.revision_id <=> (SELECT revision_id FROM articles WHERE id = ca.article_id)
+           AND cb.revision_id <=> (SELECT revision_id FROM articles WHERE id = cb.article_id)""",
+        (qid,),
+    ))
 
 
 def run_verdicts(qid: str) -> dict:

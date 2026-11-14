@@ -26,10 +26,14 @@ SELECT cl.id, MAX(h.ROW_START) AS claim_changed_at
 FROM claim_links cl
 JOIN claims c ON c.id = cl.claim_a
 JOIN articles a ON a.id = c.article_id
+JOIN claims other_c ON other_c.id = cl.claim_b
+JOIN articles other_a ON other_a.id = other_c.article_id
 JOIN claims FOR SYSTEM_TIME ALL AS h
      ON h.id IN (cl.claim_a, cl.claim_b)
     AND h.ROW_START >= cl.computed_at + INTERVAL 1 SECOND
 WHERE a.wikidata_qid = %s AND cl.verdict <> 'unmatched'
+  AND c.revision_id <=> a.revision_id
+  AND other_c.revision_id <=> other_a.revision_id
 GROUP BY cl.id
 """
 
@@ -40,7 +44,11 @@ def _link_verdicts(qid: str) -> dict:
            FROM claim_links cl
            JOIN claims c ON c.id = cl.claim_a
            JOIN articles a ON a.id = c.article_id
-           WHERE a.wikidata_qid = %s""",
+           JOIN claims other_c ON other_c.id = cl.claim_b
+           JOIN articles other_a ON other_a.id = other_c.article_id
+           WHERE a.wikidata_qid = %s
+             AND c.revision_id <=> a.revision_id
+             AND other_c.revision_id <=> other_a.revision_id""",
         (qid,),
     )
     return {r["id"]: r["verdict"] for r in rows}

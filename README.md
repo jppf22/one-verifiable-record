@@ -54,13 +54,30 @@ docker compose up --build     # MariaDB + API + web
 
 ./db/load/download_datasets.sh small
 pip install -r db/load/requirements.txt
-python db/load/import_dump.py --data-dir db/load/data
+python db/load/import_dump.py --data-dir db/load/data --only-shared
 
 pip install -r jobs/requirements.txt
-python jobs/embed.py          # CPU is fine for the small dataset
+python jobs/embed.py --tables chunks  # CPU is fine for the small dataset
+python jobs/extract_claims.py --pilot 20
+python jobs/embed.py --tables claims
+curl -X POST localhost:8000/api/align/Q12345
 ```
 
 Open http://localhost:8080 (merge view) or http://localhost:8000/docs (API reference).
+
+### Refreshing a dataset snapshot
+
+Imports are append-only: a changed article adds its new revision's chunks and retains
+the old revision for claim receipts. The merge view and RAG read only the current
+article revision. Re-run extraction, claim embedding, and alignment for refreshed
+QIDs; this is what allows a corrected Wikipedia revision to resolve a finding.
+
+For an existing database created before this behaviour, apply the one-time migration
+before importing:
+
+```bash
+docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/001_live_refresh.sql
+```
 
 ## Repository layout
 

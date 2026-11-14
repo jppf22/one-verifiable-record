@@ -261,6 +261,9 @@ function renderHeader() {
   const arts = [...(d.articles || [])].sort((a, b) => order(a.lang) - order(b.lang));
   const main = arts.find((a) => a.lang === "en") || arts[0];
   const title = main?.title || state.qid;
+  const imported = main?.fetched_at
+    ? `<span class="muted import-time" title="This comparison uses the imported revision, not live Wikipedia">Imported ${esc(fmtTime(main.fetched_at))}</span>`
+    : "";
   document.title = `${title} · One Verifiable Record`;
   const editions = arts.map((a) => {
     const href = safeUrl(a.url) || safeUrl(wikiUrl(a.lang, a.revision_id, a.title));
@@ -275,7 +278,7 @@ function renderHeader() {
     <div class="merge-title">
       <div>
         <h2>${esc(title)} <span class="muted qid">${esc(state.qid)}</span></h2>
-        <div class="editions">${editions}</div>
+        <div class="editions">${editions}</div>${imported}
       </div>
       <div class="merge-actions">
         <button type="button" data-action="recheck" ${state.rechecking ? "disabled" : ""}

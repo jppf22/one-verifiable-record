@@ -45,7 +45,7 @@ def retrieve(qid: str, question: str, lang: str | None = None, k: int | None = N
                 FROM chunks ch
                 JOIN chunk_embeddings ce ON ce.chunk_id = ch.id
                 JOIN articles a ON a.id = ch.article_id
-                WHERE a.wikidata_qid = %s{lang_filter}
+                WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter}
                 ORDER BY dist ASC
                 LIMIT %s""",
             tuple([vec, qid] + lang_param + [k]),
@@ -59,7 +59,7 @@ def retrieve(qid: str, question: str, lang: str | None = None, k: int | None = N
         f"""SELECT ch.id, ch.text, a.lang, a.title, a.revision_id
             FROM chunks ch
             JOIN articles a ON a.id = ch.article_id
-            WHERE a.wikidata_qid = %s{lang_filter} AND ({likes})
+            WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter} AND ({likes})
             LIMIT %s""",
         tuple([qid] + lang_param + [f"%{w}%" for w in words] + [k]),
     )
