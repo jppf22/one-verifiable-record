@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     nearest_k: int = 12
     counterpart_min_confidence: float = 0.90
     top_k: int = 8
+    # Public demo protection. The web app proxies /api, so these limits cover
+    # browser writes without putting a costly LLM endpoint directly on port 8000.
+    post_rate_limit_per_minute: int = 12
 
 
 settings = Settings()
