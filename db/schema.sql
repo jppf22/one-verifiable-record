@@ -59,6 +59,7 @@ CREATE TABLE chunks (
   text         MEDIUMTEXT NOT NULL,
   revision_id  BIGINT UNSIGNED NULL,
   KEY idx_article (article_id),
+  UNIQUE KEY uq_article_chunk (article_id, chunk_idx),
   CONSTRAINT fk_chunks_article FOREIGN KEY (article_id) REFERENCES articles (id)
 ) ENGINE=InnoDB;
 
@@ -73,6 +74,7 @@ CREATE TABLE chunk_embeddings (
   embedding    VECTOR(1024) NOT NULL,
   model        VARCHAR(128) NULL,
   embedded_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  embedding_quality FLOAT NULL COMMENT '0-1 quality score (normalization, validation)',
   VECTOR INDEX vidx_chunks (embedding) M=8 DISTANCE=cosine,
   CONSTRAINT fk_chunk_emb FOREIGN KEY (chunk_id) REFERENCES chunks (id)
 ) ENGINE=InnoDB;
@@ -100,12 +102,15 @@ CREATE TABLE claims (
   context_text     MEDIUMTEXT NULL COMMENT 'source paragraph/section surrounding the atomic claim',
   citation_urls    JSON NULL COMMENT 'citation URLs or identifiers found with the claim',
   extraction_confidence FLOAT NULL,
+  data_quality_score FLOAT NULL COMMENT '0-1 quality score based on validation (structure, completeness, consistency)',
   revision_id      BIGINT UNSIGNED NULL,
   model_version    VARCHAR(64) NULL COMMENT 'extractor model that produced this claim',
   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_article (article_id),
   KEY idx_chunk (chunk_id),
   KEY idx_kind (kind),
+  KEY idx_predicate (predicate),
+  KEY idx_predicate_entity (predicate_entity),
   CONSTRAINT fk_claims_article FOREIGN KEY (article_id) REFERENCES articles (id),
   CONSTRAINT fk_claims_chunk FOREIGN KEY (chunk_id) REFERENCES chunks (id)
 ) ENGINE=InnoDB
@@ -122,6 +127,7 @@ CREATE TABLE claim_embeddings (
   embedding    VECTOR(1024) NOT NULL,
   model        VARCHAR(128) NULL,
   embedded_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  embedding_quality FLOAT NULL COMMENT '0-1 quality score (normalization, validation)',
   VECTOR INDEX vidx_claims (embedding) M=8 DISTANCE=cosine,
   CONSTRAINT fk_claim_emb FOREIGN KEY (claim_id) REFERENCES claims (id)
 ) ENGINE=InnoDB;
@@ -138,9 +144,10 @@ CREATE TABLE claim_links (
   similarity     FLOAT NOT NULL COMMENT '1 - cosine distance from MariaDB vector search',
   relation       ENUM('same','related','different','unknown') NOT NULL DEFAULT 'unknown',
   candidate_confidence FLOAT NULL COMMENT 'semantic matcher confidence; similarity alone is not a verdict',
+  verdict_confidence FLOAT NULL COMMENT 'combined confidence: similarity + predicate match + layer certainty',
   verdict        ENUM('supported','contradicted','possible_match','possible_conflict',
                       'unverifiable','definition_mismatch','unmatched') NOT NULL,
-  verdict_source ENUM('deterministic','llm','human') NOT NULL,
+  verdict_source ENUM('deterministic','llm','human','deterministic-fallback') NOT NULL,
   evidence       TEXT NULL COMMENT 'receipts: source passages',
   rationale      TEXT NULL,
   computed_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

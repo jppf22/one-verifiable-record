@@ -66,33 +66,52 @@ def replace_article_material(cur, article_id: int):
     Claims and verdicts are derived from a specific revision's chunks. Keeping
     them after a chunk replacement would be worse than removing them; the
     decision tables are system-versioned, so their prior state remains auditable.
+    
+    For chunks: we use upsert (ON DUPLICATE KEY UPDATE) to preserve chunk IDs,
+    which maintains foreign key references from claims and embeddings.
+    Old chunks that are no longer present in the new import are deleted.
     """
+    # Get existing chunk IDs for this article
+    cur.execute("SELECT id, chunk_idx FROM chunks WHERE article_id = %s", (article_id,))
+    existing_chunks = {row[1]: row[0] for row in cur.fetchall()}
+    
+    # Delete claims for this article (cascade will handle claim_embeddings via FK)
+    # We must do this before deleting chunks to avoid FK violations
     cur.execute("SELECT id FROM claims WHERE article_id = %s", (article_id,))
     claim_ids = [row[0] for row in cur.fetchall()]
     if claim_ids:
         marks = ",".join(["%s"] * len(claim_ids))
+        # Detach suggestions from claim links that will be deleted
         cur.execute(
             f"UPDATE suggestions SET claim_link_id = NULL WHERE claim_link_id IN "
             f"(SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks}))",
             tuple(claim_ids + claim_ids),
         )
+        # Delete reviews (cascades with claim_links)
         cur.execute(
             f"DELETE FROM reviews WHERE claim_link_id IN "
             f"(SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks}))",
             tuple(claim_ids + claim_ids),
         )
+        # Delete claim_links
         cur.execute(
             f"DELETE FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks})",
             tuple(claim_ids + claim_ids),
         )
+        # Delete claim_embeddings
         cur.execute(f"DELETE FROM claim_embeddings WHERE claim_id IN ({marks})", tuple(claim_ids))
+        # Delete claims
         cur.execute(f"DELETE FROM claims WHERE id IN ({marks})", tuple(claim_ids))
-    cur.execute("SELECT id FROM chunks WHERE article_id = %s", (article_id,))
-    chunk_ids = [row[0] for row in cur.fetchall()]
-    if chunk_ids:
-        marks = ",".join(["%s"] * len(chunk_ids))
-        cur.execute(f"DELETE FROM chunk_embeddings WHERE chunk_id IN ({marks})", tuple(chunk_ids))
-    cur.execute("DELETE FROM chunks WHERE article_id = %s", (article_id,))
+    
+    # Mark existing chunks that we will keep (matched by chunk_idx)
+    # We'll delete any chunks that are NOT matched after the upsert
+    # For now, we delete all old chunk_embeddings for this article's chunks
+    if existing_chunks:
+        marks = ",".join(["%s"] * len(existing_chunks))
+        cur.execute(f"DELETE FROM chunk_embeddings WHERE chunk_id IN ({marks})", tuple(existing_chunks.values()))
+    
+    # Return the set of existing chunk_idx values so the caller can delete unmatched ones later
+    return existing_chunks
 
 
 PARQUET_RE = re.compile(r"^articles-(fi|sv|en)\.parquet$")
@@ -186,14 +205,37 @@ def main():
 
         # Re-import is revision-safe: invalidate all derived material before
         # changing its source chunks, while keeping system-versioned history.
-        replace_article_material(cur, article_id)
+        # For chunks, we use upsert to preserve chunk IDs for FK references.
+        existing_chunks = replace_article_material(cur, article_id)
+        
+        # Track which chunk_idx values we're processing
+        processed_chunk_indices = set()
         for idx, chunk in enumerate(split_chunks(rec.get("text", ""))):
             cur.execute(
                 """INSERT INTO chunks (article_id, chunk_idx, section, text, revision_id)
-                   VALUES (%s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE
+                     section = VALUES(section),
+                     text = VALUES(text),
+                     revision_id = VALUES(revision_id)""",
                 (article_id, idx, rec.get("section"), chunk, rec.get("revision_id")),
             )
-            n_chunks += 1
+            processed_chunk_indices.add(idx)
+            n_chunks += cur.rowcount
+        
+        # Delete any chunks that were in the old version but not in the new import
+        old_chunk_indices = set(existing_chunks.keys())
+        deleted_chunk_indices = old_chunk_indices - processed_chunk_indices
+        if deleted_chunk_indices:
+            # Get the chunk IDs for the deleted indices
+            deleted_chunk_ids = [existing_chunks[idx] for idx in deleted_chunk_indices if idx in existing_chunks]
+            if deleted_chunk_ids:
+                marks = ",".join(["%s"] * len(deleted_chunk_ids))
+                # Delete chunk_embeddings first (FK constraint)
+                cur.execute(f"DELETE FROM chunk_embeddings WHERE chunk_id IN ({marks})", tuple(deleted_chunk_ids))
+                # Then delete the chunks
+                cur.execute(f"DELETE FROM chunks WHERE id IN ({marks})", tuple(deleted_chunk_ids))
+        
         n_articles += 1
 
         if n_articles % 500 == 0:
