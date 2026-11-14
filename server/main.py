@@ -1,58 +1,51 @@
-"""One Verifiable Record — API server (page-centric, docs/page-contract.md).
+"""One Verifiable Record — API server.
 
-The unit of comparison is a PAGE (one language edition, one revision), compared
-with its counterpart pages (page_links). Endpoints (see /docs):
+Endpoints (see /docs for the interactive reference):
   GET  /api/health
-  GET  /api/pages?q=&lang=                 title search; pages with >=1 counterpart
-  GET  /api/pages/conflicted?limit=50      landing list, most conflicted first
-                                           (SQL aggregation, claim-level counts)
-  GET  /api/pages/by-title?lang&title      resolve one page (+ counterparts)
-  GET  /api/pages/{id}                     page + counterparts
-  POST /api/pages/{id}/align               vector alignment + verdict layers
-  GET  /api/pages/{id}/compare             comparison payload (rows relative to
-                                           this page: conflict / missing_here /
-                                           only_here / possible match / agree)
-  POST /api/pages/{id}/recheck             re-check; body (optional)
-                                           {"focus_link_ids": [...]}
-  POST /api/claims/clean-invalid-links      cleanup mismatched predicate links
-  POST /api/pages/{id}/clean-links          cleanup invalid links for page
-  GET  /api/pages/{id}/suggestions         generate (deduplicated) + list drafts
-  POST /api/suggestions/{id}/export        mark a draft exported, then re-check
+  GET  /api/articles?q=...                 search tracked articles
+  GET  /api/articles/by-title?lang&title   resolve one edition
+  POST /api/align/{qid}                    run alignment + verdict layers
+  POST /api/embed/{qid}                    GPU-embed missing current claims (and optional chunks)
+  GET  /api/merge/{qid}                    git-diff-style merged view (+ summary,
+                                           latest review per link, wiki permalinks)
+  POST /api/recheck/{qid}                  re-check the article; body (optional)
+                                           {"focus_link_ids": [...]}; reports which
+                                           conflicts resurface
+  GET  /api/badge?lang&title               extension summary badge (+ conflicts, gaps)
   GET  /api/claims/{id}/history            biography of a claim + its links and
                                            their reviews (FOR SYSTEM_TIME ALL)
-  POST /api/reviews                        human review (+ R1 consensus), re-check claim_a's page
-  GET  /api/links/{id}/consensus           R1 tally of one link (SVT-pinned votes)
+  POST /api/reviews                        human-in-the-loop review, then re-check
   GET  /api/reviews?link_id=               reviews of one link, newest first
-  POST /api/links/{id}/resolution          write the correct version (English) of a
-                                           reviewer-confirmed conflict; drafts it
-                                           for every language of the comparison set
-  GET  /api/links/{id}/resolution          latest resolution of a link + its drafts
-  GET  /api/qa?page=&q=&lang=              grounded Q&A over the comparison set
-  GET  /api/badge?lang&title               extension badge
-  GET  /api/extension/resolve              page-id-first extension resolver
-  GET  /api/extension/annotations           snapshot-safe inline annotation data
+  GET  /api/suggestions/{qid}              generate (deduplicated) + list patch drafts
+  POST /api/suggestions/{id}/export        mark a draft exported, then re-check
+  GET  /api/qa?qid&q                       grounded Q&A with citations
 
-The old QID endpoints (/articles, /merge, /align, /recheck, /suggestions/{qid})
-are removed. wikidata_qid is an import-time detail only.
+The full request/response shapes live in docs/frontend-contract.md.
 """
+from collections import defaultdict, deque
+from contextlib import contextmanager
+import re
+from threading import Lock
+from time import monotonic
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import alignment
-import consensus
 import diff
-import pages
+import embedding_jobs
 import patches
 import rag
 import recheck
-import resolutions
 import verdicts
+from config import settings
 from db import insert, placeholders, query, query_one
 
-app = FastAPI(title="One Verifiable Record", version="0.2.0")
+app = FastAPI(title="One Verifiable Record", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,348 +56,291 @@ app.add_middleware(
 )
 
 
+# Alignment and re-checks can make multiple inference calls. This modest,
+# in-process limiter is deliberately a safety net for a public demo, not a
+# substitute for account-level authentication in a multi-user deployment.
+_post_windows: dict[str, deque[float]] = defaultdict(deque)
+_post_lock = Lock()
+_entity_locks: dict[str, Lock] = {}
+_entity_locks_guard = Lock()
+QID_RE = re.compile(r"^Q[1-9][0-9]{0,14}$")
+
+
+def _require_qid(qid: str) -> str:
+    if not QID_RE.fullmatch(qid):
+        raise HTTPException(422, "qid must be a Wikidata identifier such as Q42")
+    return qid
+
+
+@contextmanager
+def _entity_job(qid: str):
+    """Reject overlapping costly jobs for the same entity in this API process.
+
+    Without this guard, double-clicks and retries can run the same GPU/LLM work
+    concurrently. Database uniqueness prevents duplicate links, but cannot
+    recover the duplicate inference cost or inconsistent timing.
+    """
+    with _entity_locks_guard:
+        lock = _entity_locks.setdefault(qid, Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "an alignment, embedding, or re-check is already running for this article")
+    try:
+        yield
+    finally:
+        lock.release()
+        with _entity_locks_guard:
+            if _entity_locks.get(qid) is lock and not lock.locked():
+                _entity_locks.pop(qid, None)
+
+
+@app.middleware("http")
+async def limit_costly_writes(request: Request, call_next):
+    costly = request.method == "POST" or (
+        request.method == "GET" and request.url.path.startswith("/api/suggestions/")
+    )
+    if not costly or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    # The only public path is nginx, which sets this header. Direct API access
+    # is loopback-only in compose, so it is safe to use the forwarded address.
+    client = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+    now = monotonic()
+    with _post_lock:
+        window = _post_windows[client]
+        while window and now - window[0] >= 60:
+            window.popleft()
+        if len(window) >= settings.post_rate_limit_per_minute:
+            return JSONResponse(
+                {"detail": "Too many write requests; try again in a minute."}, status_code=429,
+            )
+        window.append(now)
+    return await call_next(request)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
-def _page_or_404(page_id: int) -> dict:
-    page = pages.get_page(page_id)
-    if not page:
-        raise HTTPException(404, "page not tracked")
-    return page
+@app.get("/api/articles")
+def search_articles(q: str = Query(min_length=2, max_length=160), limit: int = 25):
+    """Search tracked entities, returning exactly one result per Wikidata QID.
 
-
-def _by_title_or_404(lang: str, title: str):
-    """(page, counterparts); 404 unless tracked and with >=1 counterpart."""
-    page = pages.find_by_title(lang, title)
-    if not page:
-        raise HTTPException(404, "page not tracked")
-    cps = pages.counterparts(page["id"])
-    if not cps:
-        raise HTTPException(404, "page has no counterpart pages")
-    return page, cps
-
-
-@app.get("/api/pages")
-def search_pages(q: str = Query(min_length=2), lang: Optional[str] = None,
-                 limit: int = Query(25, ge=1, le=100)):
-    """Title search over pages that have at least one counterpart page."""
-    lang_sql = " AND a.lang = %s" if lang else ""
+    Editions are nested beneath their shared entity rather than consuming separate
+    result slots.  This matters for a three-language corpus: limiting rows before
+    grouping made a search for a common title look like it contained duplicate pages.
+    """
+    limit = max(1, min(limit, 100))
     rows = query(
-        f"""SELECT {pages.PAGE_COLS} FROM articles a
-            WHERE a.title LIKE %s{lang_sql}
-              AND EXISTS (SELECT 1 FROM page_links pl
-                          WHERE pl.page_a = a.id AND pl.page_b <> a.id)
-            ORDER BY (a.title = %s) DESC, (a.title LIKE %s) DESC, a.title, a.lang
-            LIMIT %s""",
-        tuple([f"%{q}%"] + ([lang] if lang else []) + [q, f"{q}%", limit]),
+        """SELECT a.id, a.lang, a.title, a.wikidata_qid, a.revision_id
+           FROM articles a
+           JOIN (
+             SELECT wikidata_qid, MIN(title) AS match_title
+             FROM articles
+             WHERE title LIKE %s AND wikidata_qid IS NOT NULL
+             GROUP BY wikidata_qid
+             ORDER BY MIN(title), wikidata_qid
+             LIMIT %s
+           ) matches ON matches.wikidata_qid = a.wikidata_qid
+           ORDER BY matches.match_title, matches.wikidata_qid,
+                    CASE a.lang WHEN 'en' THEN 0 WHEN 'fi' THEN 1 WHEN 'sv' THEN 2 ELSE 3 END,
+                    a.title""",
+        (f"%{q}%", limit),
     )
-    ids = [r["id"] for r in rows]
-    cps = pages.counterparts_many(ids)
-    conflicts = pages.conflict_counts(ids, cps=cps)
-    return [
-        {"page": pages.page_obj(r), "counterparts": cps[r["id"]],
-         "conflicts": conflicts[r["id"]]}
-        for r in rows
-    ]
+    grouped = defaultdict(list)
+    for r in rows:
+        grouped[r["wikidata_qid"]].append(r)
+
+    out = []
+    for qid, editions in grouped.items():
+        # The English title is usually the most recognisable display title.  The
+        # complete edition list keeps searches in Finnish and Swedish discoverable.
+        primary = next((e for e in editions if e["lang"] == "en"), editions[0]).copy()
+        primary["editions"] = editions
+        out.append(primary)
+    return out
 
 
-@app.get("/api/pages/conflicted")
-def conflicted_pages(limit: int = Query(50, ge=1, le=200)):
-    """Landing list: pages with counterparts, most conflicted first. Uses bulk
-    comparison row construction so counts match GET /pages/{id}/compare."""
-    rows = pages.ranked_pages(min(200, max(limit, limit + 25)))
-    ids = [r["id"] for r in rows]
-    cps = pages.counterparts_many(ids)
-    stats = pages.page_stats(ids, cps=cps)
-    items = [
-        {"page": pages.page_obj(r), "counterparts": cps[r["id"]], **stats[r["id"]]}
-        for r in rows
-    ]
-    items.sort(
-        key=lambda x: (
-            -x["conflicts"],
-            -x.get("possible_conflicts", 0),
-            -(x["agree"] + x["missing_here"] + x["only_here"]),
-            x["page"]["title"],
-            x["page"]["lang"],
+PERSON_PREDICATES = {
+    "birth_date", "birth_place", "death_date", "death_place", "spouse",
+    "occupation", "office_held", "parent", "child",
+}
+PLACE_PREDICATES = {"population", "area", "area_km2", "elevation", "located_in", "coordinates"}
+ORGANIZATION_PREDICATES = {"founded", "headquarters", "parent_organization", "subsidiary"}
+EVENT_PREDICATES = {"start_date", "end_date", "outcome", "participants", "location"}
+WORK_PREDICATES = {"author", "director", "release_date", "publisher", "genre"}
+
+
+def _topic_type(predicates: set[str]) -> str:
+    """A deliberately conservative label for browse cards, not a Wikidata assertion."""
+    if predicates & PLACE_PREDICATES:
+        return "Place"
+    if predicates & ORGANIZATION_PREDICATES:
+        return "Organization"
+    if predicates & EVENT_PREDICATES:
+        return "Event"
+    if predicates & WORK_PREDICATES:
+        return "Work"
+    return "Topic"
+
+
+@app.get("/api/discover")
+def discover_articles(limit: int = Query(8, ge=1, le=20)):
+    """Return one-card-per-page discovery lists from the imported corpus.
+
+    ``high_conflicts`` is ranked by distinct contradicted claim links; ``diverse``
+    deliberately excludes pages with clear biography predicates, so the landing
+    page is not just a roster of people.
+    """
+    rows = query(
+        """SELECT a.wikidata_qid,
+                  MAX(CASE WHEN a.lang = 'en' THEN a.title END) AS english_title,
+                  MIN(a.title) AS fallback_title,
+                  COUNT(DISTINCT a.lang) AS edition_count,
+                  COUNT(DISTINCT c.id) AS claim_count,
+                  COUNT(DISTINCT CASE WHEN cl.verdict = 'contradicted' THEN cl.id END) AS conflict_count,
+                  GROUP_CONCAT(DISTINCT c.predicate SEPARATOR '|') AS predicates
+           FROM articles a
+           LEFT JOIN claims c ON c.article_id = a.id AND c.revision_id <=> a.revision_id
+           LEFT JOIN claim_links cl ON cl.claim_a = c.id
+           WHERE a.wikidata_qid IS NOT NULL
+           GROUP BY a.wikidata_qid
+           HAVING COUNT(DISTINCT a.lang) >= 2
+           ORDER BY conflict_count DESC, claim_count DESC, english_title, fallback_title
+           LIMIT 250"""
+    )
+    qids = [r["wikidata_qid"] for r in rows]
+    editions_by_qid = defaultdict(list)
+    if qids:
+        edition_rows = query(
+            f"""SELECT id, lang, title, wikidata_qid, revision_id FROM articles
+                WHERE wikidata_qid IN ({placeholders(qids)})
+                ORDER BY wikidata_qid,
+                         CASE lang WHEN 'en' THEN 0 WHEN 'fi' THEN 1 WHEN 'sv' THEN 2 ELSE 3 END,
+                         title""",
+            tuple(qids),
         )
+        for edition in edition_rows:
+            editions_by_qid[edition["wikidata_qid"]].append(edition)
+
+    cards = []
+    for row in rows:
+        predicates = {p for p in (row.get("predicates") or "").split("|") if p}
+        editions = editions_by_qid[row["wikidata_qid"]]
+        cards.append({
+            "qid": row["wikidata_qid"],
+            "title": row["english_title"] or row["fallback_title"],
+            "editions": editions,
+            "conflicts": int(row["conflict_count"] or 0),
+            "claims": int(row["claim_count"] or 0),
+            "is_person": bool(predicates & PERSON_PREDICATES),
+            "topic_type": _topic_type(predicates),
+        })
+
+    high_conflicts = [card for card in cards if card["conflicts"] > 0][:limit]
+    # Keep the broadest labels represented before adding a second item of a type.
+    diverse, seen_types = [], set()
+    candidates = [card for card in cards if not card["is_person"]]
+    for card in candidates:
+        if card["topic_type"] not in seen_types:
+            diverse.append(card)
+            seen_types.add(card["topic_type"])
+            if len(diverse) == limit:
+                break
+    if len(diverse) < limit:
+        used = {card["qid"] for card in diverse}
+        diverse.extend(card for card in candidates if card["qid"] not in used)
+    return {"high_conflicts": high_conflicts, "diverse": diverse[:limit]}
+
+
+@app.get("/api/articles/by-title")
+def by_title(lang: str, title: str):
+    row = query_one(
+        "SELECT id, lang, title, wikidata_qid, revision_id FROM articles "
+        "WHERE lang = %s AND title = %s",
+        (lang, title),
     )
-    return items[:limit]
+    if not row:
+        raise HTTPException(404, "article not tracked")
+    return row
 
 
-@app.get("/api/pages/by-title")
-def page_by_title(lang: str, title: str):
-    page, cps = _by_title_or_404(lang, title)
-    return {"page": page, "counterparts": cps}
+@app.post("/api/align/{qid}")
+def align(qid: str):
+    """Align claims across this entity's editions, then grade the links."""
+    qid = _require_qid(qid)
+    with _entity_job(qid):
+        counts = alignment.align_article(qid)
+        verdict_counts = verdicts.run_verdicts(qid)
+    return {"qid": qid, **counts, "verdicts": verdict_counts}
 
 
-@app.get("/api/pages/{page_id}")
-def page_detail(page_id: int):
-    page = _page_or_404(page_id)
-    return {"page": page, "counterparts": pages.counterparts(page_id)}
+@app.post("/api/embed/{qid}")
+def embed_entity(qid: str, include_chunks: bool = False):
+    """Embed missing current claims for one entity through the Verda GPU worker.
+
+    Pass ``include_chunks=true`` after an import to also populate RAG passages.
+    This is intentionally QID-scoped: a browser cannot accidentally start a
+    corpus-wide GPU job.
+    """
+    qid = _require_qid(qid)
+    if not query_one("SELECT 1 AS ok FROM articles WHERE wikidata_qid = %s LIMIT 1", (qid,)):
+        raise HTTPException(404, "article not tracked")
+    try:
+        with _entity_job(qid):
+            return embedding_jobs.embed_qid(qid, ("claims", "chunks") if include_chunks else ("claims",))
+    except (httpx.HTTPError, RuntimeError) as exc:
+        raise HTTPException(503, f"GPU embedding worker unavailable: {exc}")
 
 
-@app.post("/api/pages/{page_id}/align")
-def align_page(page_id: int):
-    """Align this page's claims with its counterpart pages, then grade the links."""
-    _page_or_404(page_id)
-    # Clean up any invalid links for this page before re-aligning
-    cleaned = alignment.clean_invalid_links(page_id)
-    counts = alignment.align_page(page_id)
-    verdict_counts = verdicts.run_verdicts(page_id)
-    return {"page_id": page_id, **counts, "verdicts": verdict_counts, "cleaned_invalid_links": cleaned}
-
-
-@app.get("/api/pages/{page_id}/compare")
-def compare_page(page_id: int):
-    view = diff.build_comparison(page_id)
-    if view is None:
-        raise HTTPException(404, "page not tracked")
-    return view
+@app.get("/api/merge/{qid}")
+def merge(qid: str):
+    return diff.build_merge_view(_require_qid(qid))
 
 
 class RecheckRequest(BaseModel):
-    focus_link_ids: list[int] = []
+    focus_link_ids: list[int] = Field(default_factory=list, max_length=100)
 
 
-@app.post("/api/pages/{page_id}/recheck")
-def recheck_page(page_id: int, body: Optional[RecheckRequest] = None):
-    """Re-run alignment + grading for this page and report what resurfaced."""
-    _page_or_404(page_id)
-    return recheck.recheck_page(page_id, body.focus_link_ids if body else [])
-
-
-@app.post("/api/claims/clean-invalid-links")
-def clean_invalid_links():
-    """Remove all claim_links with mismatched predicates (one-time cleanup)."""
-    cleaned = alignment.clean_invalid_links()
-    return {"cleaned": cleaned, "message": f"Removed {cleaned} invalid claim links"}
-
-
-@app.post("/api/pages/{page_id}/clean-links")
-def clean_page_links(page_id: int):
-    """Remove invalid claim_links for a specific page."""
-    _page_or_404(page_id)
-    cleaned = alignment.clean_invalid_links(page_id)
-    return {"page_id": page_id, "cleaned": cleaned, "message": f"Removed {cleaned} invalid claim links for page {page_id}"}
-
-
-@app.get("/api/pages/{page_id}/suggestions")
-def page_suggestions(page_id: int):
-    """Generate patch drafts for this page and its counterparts, list them."""
-    result = patches.generate_suggestions(page_id)
-    if result is None:
-        raise HTTPException(404, "page not tracked")
-    return result
+@app.post("/api/recheck/{qid}")
+def recheck_article(qid: str, body: Optional[RecheckRequest] = None):
+    """Re-run alignment + grading for this entity and report what resurfaced."""
+    qid = _require_qid(qid)
+    if not query_one("SELECT 1 AS ok FROM articles WHERE wikidata_qid = %s LIMIT 1", (qid,)):
+        raise HTTPException(404, "article not tracked")
+    with _entity_job(qid):
+        return recheck.recheck_article(qid, body.focus_link_ids if body else [])
 
 
 @app.get("/api/badge")
 def badge(lang: str, title: str):
-    """Summary for the browser extension: this page's status counts + verdicts."""
-    page, cps = _by_title_or_404(lang, title)
-    view = diff.build_comparison(page["id"], with_reviews=False, page=page, cps=cps)
-    counts: dict = {}
-    for row in view["rows"]:
-        for link in row["links"]:
-            counts[link["verdict"]] = counts.get(link["verdict"], 0) + 1
-    s = view["summary"]
+    """Summary for the browser extension: verdict counts + merge-view target."""
+    row = query_one(
+        "SELECT id, wikidata_qid FROM articles WHERE lang = %s AND title = %s",
+        (lang, title),
+    )
+    if not row or not row["wikidata_qid"]:
+        raise HTTPException(404, "article not tracked")
+    counts = query(
+        """SELECT cl.verdict, COUNT(*) AS n
+           FROM claim_links cl
+           JOIN claims c ON c.id = cl.claim_a
+           JOIN articles a ON a.id = c.article_id
+           JOIN claims other_c ON other_c.id = cl.claim_b
+           JOIN articles other_a ON other_a.id = other_c.article_id
+           WHERE a.wikidata_qid = %s
+             AND c.revision_id <=> a.revision_id
+             AND other_c.revision_id <=> other_a.revision_id
+           GROUP BY cl.verdict""",
+        (row["wikidata_qid"],),
+    )
+    clusters = diff.build_merge_view(row["wikidata_qid"], with_reviews=False)["clusters"]
+    status = diff.status_counts(clusters)
     return {
-        "page": page,
-        "counterparts": cps,
-        "conflicts": s["conflict"],
-        "possible_conflicts": s["possible_conflict"],
-        "missing_here": s["missing_here"],
-        "only_here": s["only_here"],
-        "possible_matches": s["possible_match"],
-        "agree": s["agree"],
-        "counts": counts,
+        "qid": row["wikidata_qid"],
+        "counts": {r["verdict"]: r["n"] for r in counts},
+        "conflicts": status["conflict"],
+        "gaps": status["gap"],
     }
-
-
-@app.get("/api/extension/resolve")
-def extension_resolve(
-    lang: str,
-    wiki_page_id: Optional[int] = Query(None, ge=1),
-    title: Optional[str] = Query(None, min_length=1, max_length=512),
-    live_revision_id: Optional[int] = Query(None, ge=1),
-):
-    """Resolve a live Wikipedia page for the Chromium companion.
-
-    This endpoint deliberately returns ``tracked: false`` for ordinary
-    non-membership rather than making the extension treat it as an error. A
-    page id is authoritative; title lookup is only a legacy/browser fallback.
-    Findings are precomputed from the imported snapshot and are accompanied by
-    a freshness state when the browser supplies a live revision id.
-    """
-    if lang not in pages.LANG_ORDER:
-        return {"tracked": False, "reason": "unsupported_language"}
-
-    page = pages.find_by_wiki_page_id(lang, wiki_page_id) if wiki_page_id else None
-    # A page id is authoritative, but title is still useful for older skins
-    # that report a transient/missing id while navigating.
-    if page is None and title:
-        page = pages.find_by_title(lang, title)
-    if page is None:
-        return {"tracked": False, "reason": "not_imported"}
-
-    cps = pages.counterparts(page["id"])
-    if not cps:
-        return {"tracked": False, "reason": "no_counterparts"}
-
-    view = diff.build_comparison(page["id"], with_reviews=False, page=page, cps=cps)
-    s = view["summary"]
-    has_claims = bool(query_one("SELECT 1 AS ok FROM claims WHERE article_id = %s LIMIT 1",
-                                (page["id"],)))
-    if live_revision_id is None:
-        freshness = "unknown"
-    elif page["revision_id"] == live_revision_id:
-        freshness = "current"
-    else:
-        freshness = "stale"
-
-    return {
-        "tracked": True,
-        "page": page,
-        "counterparts": cps,
-        "analysed_revision_id": page["revision_id"],
-        "live_revision_id": live_revision_id,
-        "freshness": freshness,
-        "analysis_status": "ready" if has_claims else "not_ready",
-        "dataset_key": f"{page['id']}:{page['revision_id'] or 'unknown'}",
-        "conflicts": s["conflict"],
-        "possible_conflicts": s.get("possible_conflict", 0),
-        "missing_here": s["missing_here"],
-        "only_here": s["only_here"],
-        "possible_matches": s.get("possible_match", 0),
-        "agree": s["agree"],
-    }
-
-
-def _extension_page(lang: str, wiki_page_id: Optional[int], title: Optional[str]):
-    """Resolve an extension request without treating ordinary misses as errors."""
-    if lang not in pages.LANG_ORDER:
-        return None, "unsupported_language"
-    page = pages.find_by_wiki_page_id(lang, wiki_page_id) if wiki_page_id else None
-    if page is None and title:
-        page = pages.find_by_title(lang, title)
-    if page is None:
-        return None, "not_imported"
-    if not pages.counterparts(page["id"]):
-        return None, "no_counterparts"
-    return page, None
-
-
-def _annotation_claim(claim: dict) -> dict:
-    """The small, stable claim representation consumed by the extension."""
-    return {
-        "id": claim["id"],
-        "lang": claim["lang"],
-        "text": claim.get("statement_text") or "",
-        "context": claim.get("context_text") or "",
-        "value": claim.get("value_text") or claim.get("value_normalized") or "",
-        "kind": claim.get("kind") or "factoid",
-        "predicate": claim.get("predicate") or "claim",
-        "revision_id": claim.get("revision_id"),
-        "revision_url": claim.get("url"),
-    }
-
-
-def _annotation_link(link: dict, claim_ids: set[int]) -> dict:
-    """Receipt information only; no scoring/recomputation happens on visits."""
-    return {
-        "id": link["id"],
-        "verdict": link.get("verdict"),
-        "evidence": link.get("evidence") or "",
-        "rationale": link.get("rationale") or "",
-        "confidence": link.get("candidate_confidence"),
-        "verdict_confidence": link.get("verdict_confidence"),
-        "similarity": link.get("similarity"),
-        "local": link.get("claim_a") in claim_ids or link.get("claim_b") in claim_ids,
-    }
-
-
-def _annotation_payload(view: dict) -> tuple[list, list]:
-    """Project comparison rows to local marks and overlay-only missing rows."""
-    annotations, missing_here = [], []
-    # Every row that has at least one local claim is annotatable so the overlay
-    # can mark all claims by type, including verified ones. "missing_here" rows
-    # have no local claim and stay in the overlay-only list below.
-    annotatable = {"conflict", "possible_conflict", "only_here", "possible_match", "agree"}
-    for row in view["rows"]:
-        status = row["status"]
-        counterparts = [_annotation_claim(c) for claims in row["there"].values() for c in claims]
-        if status == "missing_here":
-            missing_here.append({
-                "row_key": row["key"], "status": status,
-                "kind": row.get("kind") or "factoid",
-                "predicate": row.get("predicate") or "claim",
-                "counterparts": counterparts,
-                "links": [_annotation_link(link, set()) for link in row["links"]],
-            })
-            continue
-        if status not in annotatable:
-            continue
-        for local in row["here"]:
-            local_id = local["id"]
-            links = [link for link in row["links"]
-                     if link.get("claim_a") == local_id or link.get("claim_b") == local_id]
-            annotations.append({
-                "row_key": row["key"],
-                "status": status,
-                "kind": local.get("kind") or row.get("kind") or "factoid",
-                "claim": _annotation_claim(local),
-                "counterparts": counterparts,
-                "links": [_annotation_link(link, {local_id}) for link in links],
-                # The web app's hash route is deliberately represented as data
-                # so a separately deployed extension need not know its host.
-                "focus": {"lang": view["page"]["lang"], "title": view["page"]["title"],
-                          "row_key": row["key"]},
-            })
-    return annotations, missing_here
-
-
-@app.get("/api/extension/annotations")
-def extension_annotations(
-    lang: str,
-    wiki_page_id: Optional[int] = Query(None, ge=1),
-    title: Optional[str] = Query(None, min_length=1, max_length=512),
-    live_revision_id: Optional[int] = Query(None, ge=1),
-):
-    """Return already-computed inline findings for one exact live revision.
-
-    This is intentionally a read-only projection of ``diff.build_comparison``.
-    It never aligns claims or invokes a model while somebody reads Wikipedia.
-    """
-    page, reason = _extension_page(lang, wiki_page_id, title)
-    if page is None:
-        return {"tracked": False, "reason": reason, "annotations": [], "missing_here": []}
-
-    has_claims = bool(query_one("SELECT 1 AS ok FROM claims WHERE article_id = %s LIMIT 1",
-                                (page["id"],)))
-    freshness = ("unknown" if live_revision_id is None else
-                 "current" if page["revision_id"] == live_revision_id else "stale")
-    ready = has_claims
-    base = {
-        "tracked": True,
-        "page": page,
-        "analysed_revision_id": page["revision_id"],
-        "live_revision_id": live_revision_id,
-        "freshness": freshness,
-        "analysis_status": "ready" if ready else "not_ready",
-        "annotations": [],
-        "missing_here": [],
-    }
-    # Exact snapshot equality is a safety boundary: never make marks on a
-    # changed page or one whose live revision cannot be established.
-    if freshness != "current" or not ready:
-        return base
-
-    view = diff.build_comparison(page["id"], with_reviews=False, page=page,
-                                 cps=pages.counterparts(page["id"]))
-    annotations, missing_here = _annotation_payload(view)
-    return {**base, "annotations": annotations, "missing_here": missing_here}
 
 
 @app.get("/api/claims/{claim_id}/history")
@@ -437,10 +373,9 @@ def claim_history(claim_id: int):
 
 class Review(BaseModel):
     claim_link_id: int
-    reviewer: str
+    reviewer: str = Field(min_length=1, max_length=128)
     decision: str  # agree | disagree | fix
-    note: Optional[str] = None
-    override: bool = False  # Q1/Q4: let the R1 consensus decide the verdict
+    note: Optional[str] = Field(default=None, max_length=10_000)
 
 
 @app.post("/api/reviews")
@@ -448,9 +383,10 @@ def create_review(r: Review):
     if r.decision not in ("agree", "disagree", "fix"):
         raise HTTPException(422, "decision must be agree | disagree | fix")
     link = query_one(
-        """SELECT cl.id, c.article_id AS page_id
+        """SELECT cl.id, a.wikidata_qid
            FROM claim_links cl
            JOIN claims c ON c.id = cl.claim_a
+           JOIN articles a ON a.id = c.article_id
            WHERE cl.id = %s""",
         (r.claim_link_id,),
     )
@@ -461,47 +397,12 @@ def create_review(r: Review):
         "VALUES (%s, %s, %s, %s)",
         (r.claim_link_id, r.reviewer, r.decision, r.note),
     )
-    # Q1/Q4 (assumptions.md): a single review never sets the verdict. With
-    # override=true the R1 consensus (consensus.py) is evaluated: once enough
-    # distinct reviewers agree, the decided verdict is written with
-    # verdict_source='human'; if later votes break the consensus, the machine
-    # verdict comes back. Then the page of claim_a is re-checked as before.
-    override_result = consensus.enforce(r.claim_link_id) if r.override else None
-    result = recheck.recheck_page(link["page_id"], [r.claim_link_id])
-    return {"ok": True, "review_id": review_id, "override": override_result,
-            "consensus": consensus.tally(r.claim_link_id), "recheck": result}
-
-
-@app.get("/api/links/{link_id}/consensus")
-def link_consensus(link_id: int):
-    """R1 tally for one link: votes pinned to the verdict version they were cast on."""
-    if not query_one("SELECT id FROM claim_links WHERE id = %s", (link_id,)):
-        raise HTTPException(404, "claim link not found")
-    return consensus.tally(link_id)
-
-
-class Resolution(BaseModel):
-    author: str
-    correct_text: str  # the correct version, in English
-    source_url: Optional[str] = None  # reliable non-Wikipedia source
-
-
-@app.post("/api/links/{link_id}/resolution")
-def create_resolution(link_id: int, r: Resolution):
-    """Only for a conflict confirmed by reviewers (contradicted, source human).
-    Stores the English text and drafts it, translated, for every page of the
-    comparison set. Export-only: nothing is sent to Wikipedia."""
-    try:
-        return resolutions.create(link_id, r.author, r.correct_text, r.source_url)
-    except resolutions.ResolutionError as e:
-        raise HTTPException(e.status, e.message)
-
-
-@app.get("/api/links/{link_id}/resolution")
-def get_resolution(link_id: int):
-    if not query_one("SELECT id FROM claim_links WHERE id = %s", (link_id,)):
-        raise HTTPException(404, "claim link not found")
-    return resolutions.latest(link_id) or {"resolution": None, "drafts": []}
+    # The review does not overwrite the machine verdict: re-check the article
+    # and report whether the conflict resurfaces (assumptions.md, decision 4).
+    result = None
+    if link["wikidata_qid"]:
+        result = recheck.recheck_article(link["wikidata_qid"], [r.claim_link_id])
+    return {"ok": True, "review_id": review_id, "recheck": result}
 
 
 @app.get("/api/reviews")
@@ -513,6 +414,12 @@ def list_reviews(link_id: int):
     )
 
 
+@app.get("/api/suggestions/{qid}")
+def suggestions(qid: str):
+    """Generate patch drafts for this entity and return them for export."""
+    return patches.generate_suggestions(_require_qid(qid))
+
+
 @app.post("/api/suggestions/{suggestion_id}/export")
 def export_suggestion(suggestion_id: int):
     """Mark a draft exported (SVT row), then re-check with focus on its link."""
@@ -520,34 +427,15 @@ def export_suggestion(suggestion_id: int):
     if not s:
         raise HTTPException(404, "suggestion not found")
     patches.mark_exported(suggestion_id)
-    focus = [s["claim_link_id"]] if s["claim_link_id"] is not None else []
-    result = recheck.recheck_page(s["page_id"], focus)
+    result = None
+    if s["claim_link_id"] is not None and s["wikidata_qid"]:
+        result = recheck.recheck_article(s["wikidata_qid"], [s["claim_link_id"]])
     return {"ok": True, "suggestion_id": suggestion_id, "recheck": result}
 
 
 @app.get("/api/qa")
-def qa(page: int, q: str = Query(min_length=2), lang: Optional[str] = None):
-    """Grounded Q&A over the comparison set of `page` (a page id)."""
-    _page_or_404(page)
-    return rag.answer(page, q, lang)
-
-
-@app.get("/api/review/queue")
-def review_queue(
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    status: Optional[str] = Query(None),
-    lang: Optional[str] = Query(None),
-    reviewer: Optional[str] = Query(None),
-):
-    """Reviewer dashboard: paginated queue of claim links needing review.
-    
-    Filters:
-    - status: verdict type (contradicted, possible_conflict, possible_match, etc.)
-    - lang: filter by claim language (fi, sv, en)
-    - reviewer: show only links this reviewer has already voted on
-    
-    Returns: {items: [...], total: N, limit: N, offset: N}
-    Each item contains link details, both claims, and their pages.
-    """
-    return pages.review_queue(limit, offset, status, lang, reviewer)
+def qa(qid: str, q: str = Query(min_length=2, max_length=1000), lang: Optional[str] = None):
+    question = q.strip()
+    if len(question) < 2:
+        raise HTTPException(422, "q must contain at least two non-whitespace characters")
+    return rag.answer(_require_qid(qid), question, lang)

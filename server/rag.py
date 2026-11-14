@@ -1,14 +1,16 @@
 """Grounded Q&A: vector retrieval over chunks + LLM synthesis with receipts.
 
-Restricted to the comparison set of one page (the page + its counterpart
-pages), with per-page citations (page, revision, wiki URL).
+The same MariaDB vector index that powers the merge view answers reader
+questions, with per-language citations (article, revision, wiki URL).
 Falls back to lexical search when the embedder service is unreachable.
 """
 import httpx
 
 from config import settings
-from db import placeholders, query
-from pages import comparison_set
+from db import query
+
+MAX_RETRIEVAL_K = 20
+MAX_CONTEXT_CHARS = 24_000
 
 
 def _vec_literal(vec) -> str:
@@ -31,50 +33,59 @@ def embed_question(text: str) -> str | None:
         return None
 
 
-def retrieve(page_id: int, question: str, lang: str | None = None, k: int | None = None):
-    """Passages from the comparison set of page_id (the page + its counterparts)."""
-    k = k or settings.top_k
-    ids = comparison_set(page_id)
-    pages_filter = f"ch.article_id IN ({placeholders(ids)})"
+def retrieve(qid: str, question: str, lang: str | None = None, k: int | None = None):
+    k = max(1, min(k or settings.top_k, MAX_RETRIEVAL_K))
     lang_filter = " AND a.lang = %s" if lang else ""
     lang_param = [lang] if lang else []
     vec = embed_question(question)
     if vec is not None:
-        # Restricted to one comparison set (a few dozen chunks), so ranking them
+        # Restricted to one entity's editions (a few dozen chunks), so ranking them
         # by exact cosine distance is cheap. Corpus-wide search would use the HNSW
         # index via the subquery shape from the MariaDB RAG starter.
         hits = query(
-            f"""SELECT ch.id, ch.article_id AS page_id, ch.text, a.lang, a.title, a.revision_id,
+            f"""SELECT ch.id, ch.text, a.lang, a.title, a.revision_id,
                        VEC_DISTANCE_COSINE(ce.embedding, VEC_FromText(%s)) AS dist
                 FROM chunks ch
                 JOIN chunk_embeddings ce ON ce.chunk_id = ch.id
                 JOIN articles a ON a.id = ch.article_id
-                WHERE {pages_filter}{lang_filter}
+                WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter}
                 ORDER BY dist ASC
                 LIMIT %s""",
-            tuple([vec] + ids + lang_param + [k]),
+            tuple([vec, qid] + lang_param + [k]),
         )
         if hits:
             return hits
-    # lexical fallback: embedder unreachable, or these pages' chunks not embedded yet
+    # lexical fallback: embedder unreachable, or this entity's chunks not embedded yet
     words = [w for w in question.split() if len(w) > 3][:6] or [question]
-    likes = " OR ".join(["ch.text LIKE %s"] * len(words))
+    # ``%`` and ``_`` are SQL LIKE wildcards. Escape them so a reader's literal
+    # query does not accidentally turn the fallback into a corpus-wide scan.
+    def like_term(word: str) -> str:
+        return "%" + word.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
+    likes = " OR ".join(["ch.text LIKE %s ESCAPE '!'"] * len(words))
     return query(
-        f"""SELECT ch.id, ch.article_id AS page_id, ch.text, a.lang, a.title, a.revision_id
+        f"""SELECT ch.id, ch.text, a.lang, a.title, a.revision_id
             FROM chunks ch
             JOIN articles a ON a.id = ch.article_id
-            WHERE {pages_filter}{lang_filter} AND ({likes})
+            WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter} AND ({likes})
             LIMIT %s""",
-        tuple(ids + lang_param + [f"%{w}%" for w in words] + [k]),
+        tuple([qid] + lang_param + [like_term(w) for w in words] + [k]),
     )
 
 
 def synthesize(question: str, hits) -> str | None:
     if not settings.verda_api_key or not hits:
         return None
-    context = "\n\n".join(
-        f"[{h['lang']}] {h['title']} (rev {h['revision_id']}):\n{h['text']}" for h in hits
-    )
+    excerpts, used = [], 0
+    for hit in hits:
+        header = f"[{hit['lang']}] {hit['title']} (rev {hit['revision_id']}):\n"
+        remaining = MAX_CONTEXT_CHARS - used - len(header)
+        if remaining <= 0:
+            break
+        text = (hit["text"] or "")[:remaining]
+        excerpts.append(header + text)
+        used += len(header) + len(text) + 2
+    context = "\n\n".join(excerpts)
     try:
         r = httpx.post(
             f"{settings.verda_base_url}/chat/completions",
@@ -82,6 +93,7 @@ def synthesize(question: str, hits) -> str | None:
             json={
                 "model": settings.llm_model,
                 "temperature": 0,
+                "reasoning_effort": settings.llm_reasoning_effort,
                 "messages": [
                     {
                         "role": "system",
@@ -105,11 +117,10 @@ def synthesize(question: str, hits) -> str | None:
         return None
 
 
-def answer(page_id: int, question: str, lang: str | None = None) -> dict:
-    hits = retrieve(page_id, question, lang)
+def answer(qid: str, question: str, lang: str | None = None) -> dict:
+    hits = retrieve(qid, question, lang)
     citations = [
         {
-            "page_id": h["page_id"],
             "lang": h["lang"],
             "title": h["title"],
             "revision_id": h["revision_id"],
@@ -121,7 +132,7 @@ def answer(page_id: int, question: str, lang: str | None = None) -> dict:
         for h in hits
     ]
     return {
-        "page_id": page_id,
+        "qid": qid,
         "question": question,
         "answer": synthesize(question, hits)
         or "No synthesized answer: the LLM is unavailable (check VERDA_API_KEY and the model subscription). The retrieved passages are cited below.",

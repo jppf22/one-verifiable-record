@@ -88,7 +88,10 @@ CREATE TABLE claims (
   id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   article_id       BIGINT UNSIGNED NOT NULL,
   chunk_id         BIGINT UNSIGNED NOT NULL,
-  kind             ENUM('date','number','quantity','entity_relation','factoid') NOT NULL,
+  -- A descriptive extraction label, not a controlled vocabulary.  The relation
+  -- being checked is `predicate`; new kinds and predicates must not require a
+  -- schema or code change.
+  kind             VARCHAR(64) NOT NULL,
   subject          VARCHAR(512) NULL,
   subject_entity   VARCHAR(32) NULL COMMENT 'Wikidata QID when entity linking resolved the subject',
   predicate        VARCHAR(255) NULL,

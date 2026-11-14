@@ -6,8 +6,9 @@ Junction 2026 · MariaDB challenge #307 ("Wikipedia Through Time")
 > Wikipedia's language editions are parallel branches of the same truth.
 > **One Verifiable Record is the merge tool.**
 
-Pick an article. We decompose the fi / sv / en editions into **atomic claims**, align them across
-languages with multilingual embeddings inside MariaDB, and render a **git-diff-style merge view**:
+Pick an article. We decompose every imported source chunk in its fi / sv / en editions into
+**atomic claims**, align them across languages with multilingual embeddings inside MariaDB, and
+render a **git-diff-style merge view**:
 what the editions agree on, where they contradict each other, and what one edition simply does not
 know yet. Every verdict ships with **receipts**: the source passage, the revision id, and a deep
 link back into Wikipedia.
@@ -16,13 +17,13 @@ link back into Wikipedia.
 
 | Feature | Implementation |
 | --- | --- |
-| Cross-language claim alignment | MariaDB vector search (`VEC_DISTANCE_COSINE`, HNSW index) over multilingual claim embeddings |
+| Cross-language claim alignment | Every extracted claim is searched in each other available language; dynamic predicate recall plus MariaDB vector search (`VEC_DISTANCE_COSINE`, HNSW index) over multilingual claim embeddings |
 | Verdicts with receipts | `supported` / `contradicted` / `unverifiable` + evidence passage, revision id, wiki link |
 | Claim provenance — "biography of a sentence" | MariaDB System-Versioned Tables (`claims`, `claim_links`, `reviews`, `suggestions`) |
 | Grounded Q&A (RAG track) | The same vector index over article chunks; answers cite per-language sources |
 | Human-in-the-loop review | Review console to confirm/fix verdicts; every decision is itself versioned |
 | Patch generation | Per-language proposed wikitext edits / talk-page drafts, one-click export (never automated editing) |
-| Wikipedia companion extension | Snapshot-safe inline claim annotations, findings tray, receipts and focused comparison deep links on live Wikipedia articles |
+| Wikipedia companion extension | Manifest V3 consistency badge + deep links on live Wikipedia articles |
 
 ## Architecture
 
@@ -63,22 +64,35 @@ python jobs/embed.py --tables claims
 curl -X POST localhost:8000/api/align/Q12345
 ```
 
-### Full-page comparison refresh
+Claim predicates are extractor-generated canonical relations, not an application
+allow-list. For existing data made with an older extractor, re-run extraction and
+embedding before interpreting coverage. For example, for a selected entity:
 
-The extractor processes every imported article chunk, retaining entity IDs,
-typed canonical values, qualifiers, source context and citation identifiers.
-For an existing database, apply
-[`db/migrations/001_page_links.sql`](db/migrations/001_page_links.sql) and then
-[`db/migrations/002_richer_claim_comparison.sql`](db/migrations/002_richer_claim_comparison.sql)
-before deploying this revision. Then re-import the current dump, run
-`python jobs/extract_claims.py --all-trilingual --reextract`, re-embed claims,
-and align the pages. `--reextract` deliberately replaces active derived rows;
-their system-versioned history remains available for audit.
+```bash
+python jobs/extract_claims.py --qids Q12345 --replace-current
+python jobs/embed.py --tables claims
+curl -X POST localhost:8000/api/align/Q12345
+```
 
-Candidate generation is intentionally broad (12 nearest claims per counterpart
-and a relaxed vector distance). The comparison view distinguishes confirmed
-conflicts from **possible conflicts** and **possible matches**, so an uncertain
-alignment is visible rather than being silently represented as two gaps.
+`--replace-current` is deliberately scoped to the selected QIDs and records the
+prior system-versioned claim/link rows as history.
+
+### On-demand Verda GPU embeddings
+
+When `GPU_EMBED_BASE_URL` and `GPU_EMBED_TOKEN` point at the protected Verda
+worker, embed only the missing current claim vectors for one page:
+
+```bash
+# Run on the app VM (or use the public web origin's /api proxy).
+curl -X POST 'http://localhost:8000/api/embed/Q12345'
+```
+
+Add `?include_chunks=true` after an import to embed the page's RAG passages as
+well. The API sends text batches to the GPU worker but writes vectors through
+the app VM's existing MariaDB connection, so MariaDB is never exposed on the
+GPU VM. The worker is intentionally QID-scoped and GPU-billed while running;
+stop it with `verda vm shutdown --id <gpu-worker-id>` when it is no longer
+needed.
 
 Open http://localhost:8080 (merge view) or http://localhost:8000/docs (API reference).
 
@@ -94,17 +108,8 @@ before importing:
 
 ```bash
 docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/001_live_refresh.sql
+docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/002_open_claim_taxonomy.sql
 ```
-
-Databases created before the "fix it in every language" feature also need migration 004
-(adds `resolutions` and `suggestions.resolution_id`, relabels LLM-error verdicts). It is
-idempotent. It alters system-versioned tables, so run it as root:
-
-```bash
-docker compose exec -T mariadb sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' < db/migrations/004_resolutions.sql
-docker compose exec -T mariadb sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' < db/migrations/006_quality_columns.sql
-```
-Migration 006 adds the pipeline quality columns; without it every claim extraction and embedding fails.
 
 ## Repository layout
 

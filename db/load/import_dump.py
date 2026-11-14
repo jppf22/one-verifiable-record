@@ -43,18 +43,38 @@ def connect():
     return conn
 
 
+def _split_long_paragraph(paragraph: str):
+    """Yield bounded pieces without dropping text when one paragraph is huge."""
+    while len(paragraph) > TARGET_CHUNK_CHARS:
+        # Prefer a natural boundary, but do not let an unbroken URL/table make
+        # the source chunk arbitrarily large.
+        cut = paragraph.rfind(" ", 0, TARGET_CHUNK_CHARS + 1)
+        if cut < TARGET_CHUNK_CHARS // 2:
+            cut = TARGET_CHUNK_CHARS
+        yield paragraph[:cut].strip()
+        paragraph = paragraph[cut:].lstrip()
+    if paragraph:
+        yield paragraph
+
+
 def split_chunks(text: str):
-    """Split article text into paragraph-bounded chunks of ~TARGET_CHUNK_CHARS."""
+    """Split article text into paragraph-bounded chunks of ~TARGET_CHUNK_CHARS.
+
+    A long paragraph is further split at whitespace.  Without that fallback a
+    single malformed or list-heavy paragraph can become a multi-megabyte model
+    input despite the nominal chunk target.
+    """
     parts, cur, n = [], "", 0
     for para in SPLIT_RE.split(text or ""):
         para = para.strip()
         if not para:
             continue
-        if cur and n + len(para) > TARGET_CHUNK_CHARS:
+        for piece in _split_long_paragraph(para):
+            if cur and n + len(piece) > TARGET_CHUNK_CHARS:
             parts.append(cur.strip())
             cur, n = "", 0
-        cur += para + "\n\n"
-        n += len(para) + 2
+            cur += piece + "\n\n"
+            n += len(piece) + 2
     if cur.strip():
         parts.append(cur.strip())
     return parts or [""]
