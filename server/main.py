@@ -37,6 +37,7 @@ import patches
 import rag
 import recheck
 import verdicts
+from config import settings
 from db import insert, placeholders, query, query_one
 
 app = FastAPI(title="One Verifiable Record", version="0.1.0")
