@@ -6,11 +6,11 @@ VECTOR(1024) in db/schema.sql). If you switch to a model with a different
 dimension, update the schema accordingly.
 
 Run on a GPU instance for the large dataset; CPU is fine for small/medium.
-Idempotent: only rows whose embedding is NULL are processed, so the job can
+Idempotent: only rows without a row in chunk_embeddings / claim_embeddings are processed, so the job can
 be interrupted and resumed.
 
 Usage:
-  python embed.py [--model intfloat/multilingual-e5-large]
+  python embed.py [--model intfloat/multilingual-e5-large] [--endpoint URL]
                   [--batch-size 64] [--tables chunks,claims] [--limit 0]
 """
 import argparse
@@ -19,9 +19,11 @@ import sys
 import time
 
 import mariadb
-from sentence_transformers import SentenceTransformer
 
-PASSAGE_PREFIX = "passage: "  # E5 instruction prefix for indexed text
+# E5 instruction prefixes: chunks are retrieval passages (asymmetric, matched
+# against "query: " questions); claims are matched claim-to-claim (symmetric),
+# for which E5 recommends "query: " on both sides.
+PREFIX = {"chunks": "passage: ", "claims": "query: "}
 
 
 def connect():
@@ -38,29 +40,53 @@ def vec_literal(vec) -> str:
     return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
 
 
-def run(model: SentenceTransformer, table: str, batch_size: int, limit: int):
+EMB_TABLES = {
+    # source table -> (text column, embedding table, foreign-key column)
+    "chunks": ("text", "chunk_embeddings", "chunk_id"),
+    "claims": ("statement_text", "claim_embeddings", "claim_id"),
+}
+
+
+class HttpEncoder:
+    """Same encode() shape as SentenceTransformer, backed by embedder/ (/v1/embeddings)."""
+
+    def __init__(self, base_url: str, model: str):
+        import httpx  # only needed in endpoint mode
+        self.http, self.url, self.model = httpx.Client(timeout=300), base_url.rstrip("/"), model
+
+    def encode(self, texts, **_kw):
+        # prefixes are already applied by run(), so the service keeps them as-is
+        r = self.http.post(f"{self.url}/embeddings", json={"model": self.model, "input": texts})
+        r.raise_for_status()
+        return [d["embedding"] for d in sorted(r.json()["data"], key=lambda d: d["index"])]
+
+
+def run(model, table: str, batch_size: int, limit: int, model_name: str = ""):
     conn = connect()
     cur = conn.cursor()
-    text_col = "text" if table == "chunks" else "statement_text"
+    text_col, emb_table, fk = EMB_TABLES[table]
     total, started = 0, time.time()
     while True:
         cur.execute(
-            f"SELECT id, {text_col} FROM {table} WHERE embedding IS NULL "
-            f"ORDER BY id LIMIT %s",
+            f"SELECT t.id, t.{text_col} FROM {table} t "
+            f"LEFT JOIN {emb_table} e ON e.{fk} = t.id "
+            f"WHERE e.{fk} IS NULL ORDER BY t.id LIMIT %s",
             (batch_size,),
         )
         rows = cur.fetchall()
         if not rows:
             break
-        texts = [PASSAGE_PREFIX + (r[1] or "") for r in rows]
+        texts = [PREFIX[table] + (r[1] or "") for r in rows]
         embs = model.encode(
             texts, batch_size=batch_size, normalize_embeddings=True,
             show_progress_bar=False,
         )
         for (row_id, _text), emb in zip(rows, embs):
             cur.execute(
-                f"UPDATE {table} SET embedding = VEC_FromText(%s) WHERE id = %s",
-                (vec_literal(emb), row_id),
+                f"INSERT INTO {emb_table} ({fk}, embedding, model) "
+                f"VALUES (%s, VEC_FromText(%s), %s) "
+                f"ON DUPLICATE KEY UPDATE embedding = VALUES(embedding), model = VALUES(model)",
+                (row_id, vec_literal(emb), model_name or None),
             )
         conn.commit()
         total += len(rows)
@@ -77,15 +103,23 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--tables", default="chunks,claims", help="comma-separated subset of chunks,claims")
     ap.add_argument("--limit", type=int, default=0, help="stop after N rows per table (0 = no limit)")
+    ap.add_argument("--endpoint", default=os.environ.get("EMBED_BASE_URL", ""),
+                    help="use the embedder service (e.g. http://embedder:8001/v1) instead of "
+                         "loading the model in-process")
     args = ap.parse_args()
 
-    print(f"Loading model: {args.model}", file=sys.stderr)
-    model = SentenceTransformer(args.model)
+    if args.endpoint:
+        print(f"Using embedder service: {args.endpoint}", file=sys.stderr)
+        model = HttpEncoder(args.endpoint, args.model)
+    else:
+        from sentence_transformers import SentenceTransformer
+        print(f"Loading model: {args.model}", file=sys.stderr)
+        model = SentenceTransformer(args.model)
 
     for table in [t.strip() for t in args.tables.split(",") if t.strip()]:
         if table not in ("chunks", "claims"):
             sys.exit(f"unknown table: {table}")
-        total = run(model, table, args.batch_size, args.limit)
+        total = run(model, table, args.batch_size, args.limit, args.model)
         print(f"done: {table} ({total} rows)")
 
 

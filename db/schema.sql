@@ -27,7 +27,7 @@ CREATE TABLE articles (
 
 -- ----------------------------------------------------------------------------
 -- chunks: passage splits of article text. Substrate for RAG retrieval.
--- embedding is NULL until jobs/embed.py runs (multilingual-e5-large, 1024 dims).
+-- Embeddings live in chunk_embeddings (see below), written by jobs/embed.py.
 -- ----------------------------------------------------------------------------
 CREATE TABLE chunks (
   id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -35,14 +35,25 @@ CREATE TABLE chunks (
   chunk_idx    INT NOT NULL,
   section      VARCHAR(255) NULL,
   text         MEDIUMTEXT NOT NULL,
-  embedding    VECTOR(1024) NULL,
   revision_id  BIGINT UNSIGNED NULL,
   KEY idx_article (article_id),
   CONSTRAINT fk_chunks_article FOREIGN KEY (article_id) REFERENCES articles (id)
 ) ENGINE=InnoDB;
 
--- HNSW index: all retrieval (RAG + merge view) is a single SQL statement.
-CREATE VECTOR INDEX vidx_chunks ON chunks (embedding) USING HNSW (M=8, ef_CONSTRUCT=64);
+-- ----------------------------------------------------------------------------
+-- chunk_embeddings: one multilingual-e5-large vector (1024 dims) per chunk.
+-- Kept in a separate table because MariaDB vector indexes need NOT NULL columns,
+-- while rows are imported before the embedding job runs. A missing row means
+-- "not embedded yet". HNSW index: all RAG retrieval is a single SQL statement.
+-- ----------------------------------------------------------------------------
+CREATE TABLE chunk_embeddings (
+  chunk_id     BIGINT UNSIGNED PRIMARY KEY,
+  embedding    VECTOR(1024) NOT NULL,
+  model        VARCHAR(128) NULL,
+  embedded_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  VECTOR INDEX vidx_chunks (embedding) M=8 DISTANCE=cosine,
+  CONSTRAINT fk_chunk_emb FOREIGN KEY (chunk_id) REFERENCES chunks (id)
+) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
 -- claims: atomic statements extracted from chunks. The diff unit of the merge
@@ -62,7 +73,6 @@ CREATE TABLE claims (
   revision_id      BIGINT UNSIGNED NULL,
   model_version    VARCHAR(64) NULL COMMENT 'extractor model that produced this claim',
   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  embedding        VECTOR(1024) NULL COMMENT 'claim-level embedding for cross-language matching',
   KEY idx_article (article_id),
   KEY idx_chunk (chunk_id),
   KEY idx_kind (kind),
@@ -71,7 +81,20 @@ CREATE TABLE claims (
 ) ENGINE=InnoDB
 WITH SYSTEM VERSIONING;
 
-CREATE VECTOR INDEX vidx_claims ON claims (embedding) USING HNSW (M=8, ef_CONSTRUCT=64);
+-- ----------------------------------------------------------------------------
+-- claim_embeddings: claim-level vectors for cross-language matching. Deliberately
+-- NOT system-versioned and NOT on `claims`: writing an embedding must not add a
+-- new claim version. The claim's history ("biography of a sentence") and the
+-- re-check's staleness test only see real content changes.
+-- ----------------------------------------------------------------------------
+CREATE TABLE claim_embeddings (
+  claim_id     BIGINT UNSIGNED PRIMARY KEY,
+  embedding    VECTOR(1024) NOT NULL,
+  model        VARCHAR(128) NULL,
+  embedded_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  VECTOR INDEX vidx_claims (embedding) M=8 DISTANCE=cosine,
+  CONSTRAINT fk_claim_emb FOREIGN KEY (claim_id) REFERENCES claims (id)
+) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
 -- claim_links: cross-language alignment between two claims + its verdict.

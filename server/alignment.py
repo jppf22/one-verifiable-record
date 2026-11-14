@@ -10,12 +10,14 @@ from db import get_conn, query
 
 NEAREST_SQL = """
 SELECT c2.id AS claim_b, c2.statement_text, a2.lang AS other_lang,
-       VEC_DISTANCE_COSINE(c2.embedding, c1.embedding) AS dist
+       VEC_DISTANCE_COSINE(e2.embedding, e1.embedding) AS dist
 FROM claims c1
+JOIN claim_embeddings e1 ON e1.claim_id = c1.id
 JOIN articles a1 ON a1.id = c1.article_id
 JOIN articles a2 ON a2.wikidata_qid = a1.wikidata_qid AND a2.lang <> a1.lang
-JOIN claims c2 ON c2.article_id = a2.id AND c2.embedding IS NOT NULL
-WHERE c1.id = %s AND c1.embedding IS NOT NULL
+JOIN claims c2 ON c2.article_id = a2.id
+JOIN claim_embeddings e2 ON e2.claim_id = c2.id
+WHERE c1.id = %s
 ORDER BY dist ASC
 LIMIT %s
 """

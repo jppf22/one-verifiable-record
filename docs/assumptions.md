@@ -34,6 +34,41 @@ the owner go under "Open questions". Agents add entries here as they make calls.
 - A5. The old `/?qid=Q…` link (used by the extension) keeps working and redirects to
   `#/merge/Q…`.
 
+## Deployment & data pipeline (2026-11-14)
+User-confirmed:
+- D1. Embeddings live in separate tables `chunk_embeddings` / `claim_embeddings`
+  (NOT NULL, HNSW `DISTANCE=cosine`, not versioned). MariaDB vector indexes need NOT
+  NULL columns, and writing an embedding must not create a new `claims` version.
+- D2. Claims are extracted with the **LLM (Verda, Kimi K3.1 Pro)**: a pilot of ~20
+  best-covered tri-lingual topics first, reviewed with the owner, then all 2,919
+  tri-lingual topics in the background.
+- D3. The owner asked for a **GPU instance** for bulk embedding (pending: needs Verda
+  cloud credentials or CLI access).
+
+Assumed (coordinator):
+- D4. Verda Inference is `https://inference.verda.com/v1`, model id `kimi-k3-1-pro`. The
+  old `api.verda.com` URL and `kimi-k3.1-pro` id were wrong. The gateway has **no
+  `/v1/embeddings`**, so e5-large is served by our own `embedder` container
+  (OpenAI-style API). Q&A query embedding and `jobs/embed.py --endpoint` use it.
+- D5. Extraction sends only the first ~6,000 characters per article (lead + opening
+  sections). That caps cost and covers the facts editions most often share.
+- D6. Claim `statement_text` stays in the source language (the receipt). `subject` and
+  `predicate` are canonical English snake_case, so cross-language claims share a
+  vocabulary.
+- D7. Deterministic layer is tightened:
+  - It only compares values when both claims have the **same predicate**, so
+    vector neighbours like "born 1900" vs "died 1986" aren't false conflicts.
+  - Dates compare at the **coarser precision** ("1900" agrees with "1900-09-03").
+  - **Differing numbers go to the LLM** (often time-qualified, e.g. population by
+    year). Equal numbers are still `supported` deterministically.
+- D8. E5 prefixes: chunks use `passage: ` (retrieval). Claims use `query: ` on both
+  sides (symmetric claim-to-claim matching).
+- D9. The importer loads only articles whose QID exists in 2+ languages
+  (`--only-shared`): 17,431 articles, 54,144 chunks.
+- D10. Known issue: re-import deletes and reinserts `chunks`, which fails once claims or
+  embeddings reference them (FKs). The A1 "re-import to resolve" story needs an upsert
+  re-import. Not built yet; see Q3.
+
 ## Assumed (extension)
 - X1. (extension) If the server's badge response has no `gaps` field (older server), the
   badge omits the gaps segment instead of showing "0 gaps". Conflicts fall back to
@@ -114,3 +149,7 @@ the owner go under "Open questions". Agents add entries here as they make calls.
 - Q2. Should the re-check eventually fetch the **live** Wikipedia revision (MediaWiki API)
   so an applied patch can show "Resolved"? Today it uses the DB snapshot (A1), so
   conflicts resurface until a re-import.
+- Q3. Re-import with changed revisions (needed for a conflict to ever be "resolved",
+  A1): should new revisions **update claims in place**, so SVT keeps the old version
+  and the re-check sees them as stale, or be stored as **new articles/claims rows**?
+  Updating in place fits the SVT story best.

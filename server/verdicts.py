@@ -16,20 +16,41 @@ from db import execute, placeholders, query
 NUMERIC_TOLERANCE = 1e-9
 
 
+def _same_fact(a: dict, b: dict) -> bool:
+    """Only compare values when both claims state the same relation. Vector
+    neighbours can be different facts ("born 1900" vs "died 1986"), so a
+    deterministic contradiction needs matching canonical predicates."""
+    pa, pb = (a.get("predicate") or "").lower(), (b.get("predicate") or "").lower()
+    return bool(pa) and pa == pb
+
+
+def _date_verdict(va: str, vb: str) -> str:
+    """ISO dates at mixed precision: "1900" and "1900-09-03" agree. Compare at
+    the coarser of the two precisions."""
+    n = min(len(va.lstrip("-")), len(vb.lstrip("-")))
+    same_sign = va.startswith("-") == vb.startswith("-")
+    return "supported" if same_sign and va.lstrip("-")[:n] == vb.lstrip("-")[:n] else "contradicted"
+
+
 def deterministic_verdict(a: dict, b: dict) -> str | None:
     """Return a verdict, or None if this pair needs the LLM layer."""
-    if a["kind"] != b["kind"]:
+    if a["kind"] != b["kind"] or not _same_fact(a, b):
+        return None
+    va, vb = a["value_normalized"], b["value_normalized"]
+    if not va or not vb:
         return None
     if a["kind"] == "date":
-        if not a["value_normalized"] or not b["value_normalized"]:
-            return None
-        return "supported" if a["value_normalized"] == b["value_normalized"] else "contradicted"
+        return _date_verdict(va, vb)
     if a["kind"] in ("number", "quantity"):
         try:
-            va, vb = float(a["value_normalized"]), float(b["value_normalized"])
+            fa, fb = float(va), float(vb)
         except (TypeError, ValueError):
             return None
-        return "supported" if abs(va - vb) <= NUMERIC_TOLERANCE else "contradicted"
+        if abs(fa - fb) <= NUMERIC_TOLERANCE:
+            return "supported"
+        # Differing numbers are often time-qualified (population in 2019 vs 2023),
+        # which only the LLM layer can judge from the statement text.
+        return None
     return None  # entity_relation / factoid -> LLM
 
 
@@ -91,8 +112,10 @@ PAIR_SELECT = """
 SELECT cl.id AS link_id, cl.verdict AS verdict, cl.verdict_source AS verdict_source,
        ca.id AS a_id, ca.kind AS a_kind, ca.statement_text AS a_text,
        ca.value_normalized AS a_value, aa.lang AS a_lang,
+       ca.predicate AS a_predicate, ca.subject AS a_subject,
        cb.id AS b_id, cb.kind AS b_kind, cb.statement_text AS b_text,
-       cb.value_normalized AS b_value, ab.lang AS b_lang
+       cb.value_normalized AS b_value, ab.lang AS b_lang,
+       cb.predicate AS b_predicate, cb.subject AS b_subject
 FROM claim_links cl
 JOIN claims ca ON ca.id = cl.claim_a
 JOIN articles aa ON aa.id = ca.article_id
@@ -106,6 +129,7 @@ def _side(p: dict, prefix: str) -> dict:
         "id": p[f"{prefix}_id"], "kind": p[f"{prefix}_kind"],
         "statement_text": p[f"{prefix}_text"],
         "value_normalized": p[f"{prefix}_value"], "lang": p[f"{prefix}_lang"],
+        "predicate": p.get(f"{prefix}_predicate"), "subject": p.get(f"{prefix}_subject"),
     }
 
 
