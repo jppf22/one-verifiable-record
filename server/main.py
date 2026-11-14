@@ -23,6 +23,8 @@ Endpoints (see /docs for the interactive reference):
 The full request/response shapes live in docs/frontend-contract.md.
 """
 from collections import defaultdict, deque
+from contextlib import contextmanager
+import re
 from threading import Lock
 from time import monotonic
 from typing import Optional
@@ -31,7 +33,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import alignment
 import diff
@@ -59,11 +61,44 @@ app.add_middleware(
 # substitute for account-level authentication in a multi-user deployment.
 _post_windows: dict[str, deque[float]] = defaultdict(deque)
 _post_lock = Lock()
+_entity_locks: dict[str, Lock] = {}
+_entity_locks_guard = Lock()
+QID_RE = re.compile(r"^Q[1-9][0-9]{0,14}$")
+
+
+def _require_qid(qid: str) -> str:
+    if not QID_RE.fullmatch(qid):
+        raise HTTPException(422, "qid must be a Wikidata identifier such as Q42")
+    return qid
+
+
+@contextmanager
+def _entity_job(qid: str):
+    """Reject overlapping costly jobs for the same entity in this API process.
+
+    Without this guard, double-clicks and retries can run the same GPU/LLM work
+    concurrently. Database uniqueness prevents duplicate links, but cannot
+    recover the duplicate inference cost or inconsistent timing.
+    """
+    with _entity_locks_guard:
+        lock = _entity_locks.setdefault(qid, Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "an alignment, embedding, or re-check is already running for this article")
+    try:
+        yield
+    finally:
+        lock.release()
+        with _entity_locks_guard:
+            if _entity_locks.get(qid) is lock and not lock.locked():
+                _entity_locks.pop(qid, None)
 
 
 @app.middleware("http")
 async def limit_costly_writes(request: Request, call_next):
-    if request.method != "POST" or not request.url.path.startswith("/api/"):
+    costly = request.method == "POST" or (
+        request.method == "GET" and request.url.path.startswith("/api/suggestions/")
+    )
+    if not costly or not request.url.path.startswith("/api/"):
         return await call_next(request)
     # The only public path is nginx, which sets this header. Direct API access
     # is loopback-only in compose, so it is safe to use the forwarded address.
@@ -87,7 +122,7 @@ def health():
 
 
 @app.get("/api/articles")
-def search_articles(q: str = Query(min_length=2), limit: int = 25):
+def search_articles(q: str = Query(min_length=2, max_length=160), limit: int = 25):
     """Search tracked entities, returning exactly one result per Wikidata QID.
 
     Editions are nested beneath their shared entity rather than consuming separate
@@ -232,8 +267,10 @@ def by_title(lang: str, title: str):
 @app.post("/api/align/{qid}")
 def align(qid: str):
     """Align claims across this entity's editions, then grade the links."""
-    counts = alignment.align_article(qid)
-    verdict_counts = verdicts.run_verdicts(qid)
+    qid = _require_qid(qid)
+    with _entity_job(qid):
+        counts = alignment.align_article(qid)
+        verdict_counts = verdicts.run_verdicts(qid)
     return {"qid": qid, **counts, "verdicts": verdict_counts}
 
 
@@ -245,29 +282,33 @@ def embed_entity(qid: str, include_chunks: bool = False):
     This is intentionally QID-scoped: a browser cannot accidentally start a
     corpus-wide GPU job.
     """
+    qid = _require_qid(qid)
     if not query_one("SELECT 1 AS ok FROM articles WHERE wikidata_qid = %s LIMIT 1", (qid,)):
         raise HTTPException(404, "article not tracked")
     try:
-        return embedding_jobs.embed_qid(qid, ("claims", "chunks") if include_chunks else ("claims",))
+        with _entity_job(qid):
+            return embedding_jobs.embed_qid(qid, ("claims", "chunks") if include_chunks else ("claims",))
     except (httpx.HTTPError, RuntimeError) as exc:
         raise HTTPException(503, f"GPU embedding worker unavailable: {exc}")
 
 
 @app.get("/api/merge/{qid}")
 def merge(qid: str):
-    return diff.build_merge_view(qid)
+    return diff.build_merge_view(_require_qid(qid))
 
 
 class RecheckRequest(BaseModel):
-    focus_link_ids: list[int] = []
+    focus_link_ids: list[int] = Field(default_factory=list, max_length=100)
 
 
 @app.post("/api/recheck/{qid}")
 def recheck_article(qid: str, body: Optional[RecheckRequest] = None):
     """Re-run alignment + grading for this entity and report what resurfaced."""
+    qid = _require_qid(qid)
     if not query_one("SELECT 1 AS ok FROM articles WHERE wikidata_qid = %s LIMIT 1", (qid,)):
         raise HTTPException(404, "article not tracked")
-    return recheck.recheck_article(qid, body.focus_link_ids if body else [])
+    with _entity_job(qid):
+        return recheck.recheck_article(qid, body.focus_link_ids if body else [])
 
 
 @app.get("/api/badge")
@@ -332,9 +373,9 @@ def claim_history(claim_id: int):
 
 class Review(BaseModel):
     claim_link_id: int
-    reviewer: str
+    reviewer: str = Field(min_length=1, max_length=128)
     decision: str  # agree | disagree | fix
-    note: Optional[str] = None
+    note: Optional[str] = Field(default=None, max_length=10_000)
 
 
 @app.post("/api/reviews")
@@ -376,7 +417,7 @@ def list_reviews(link_id: int):
 @app.get("/api/suggestions/{qid}")
 def suggestions(qid: str):
     """Generate patch drafts for this entity and return them for export."""
-    return patches.generate_suggestions(qid)
+    return patches.generate_suggestions(_require_qid(qid))
 
 
 @app.post("/api/suggestions/{suggestion_id}/export")
@@ -393,5 +434,8 @@ def export_suggestion(suggestion_id: int):
 
 
 @app.get("/api/qa")
-def qa(qid: str, q: str = Query(min_length=2), lang: Optional[str] = None):
-    return rag.answer(qid, q, lang)
+def qa(qid: str, q: str = Query(min_length=2, max_length=1000), lang: Optional[str] = None):
+    question = q.strip()
+    if len(question) < 2:
+        raise HTTPException(422, "q must contain at least two non-whitespace characters")
+    return rag.answer(_require_qid(qid), question, lang)

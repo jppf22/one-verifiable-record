@@ -117,6 +117,24 @@ def article_chunks(cur, article_id: int):
     return [(ch, ch["text"] or "") for ch in chunks]
 
 
+def _split_for_request(chunk, text: str, batch_chars: int):
+    """Yield source-preserving slices for an oversized imported chunk.
+
+    Current imports produce bounded chunks, but this also protects old imports
+    and arbitrary JSONL input. Reusing the chunk index keeps every extracted
+    claim attached to its original source receipt.
+    """
+    text = text or ""
+    while len(text) > batch_chars:
+        cut = text.rfind(" ", 0, batch_chars + 1)
+        if cut < batch_chars // 2:
+            cut = batch_chars
+        yield chunk, text[:cut]
+        text = text[cut:].lstrip()
+    if text:
+        yield chunk, text
+
+
 def call_llm(http: httpx.Client, args, title: str, lang: str, picked) -> list:
     excerpt = "\n\n".join(f"[#{ch['chunk_idx']}]\n{text}" for ch, text in picked)
     body = {
@@ -236,16 +254,17 @@ def extract_article(args, art: dict) -> tuple:
         chunks = article_chunks(cur, art["id"])
         if not chunks:
             return art, 0, "no chunks"
-        # Each input chunk is included exactly once.  `batch_chars` limits an
+        # Every source character is included once. `batch_chars` limits an
         # individual request, not the portion of the article that is audited.
         batches, batch, used = [], [], 0
-        for item in chunks:
-            text_len = len(item[1])
-            if batch and used + text_len > args.batch_chars:
-                batches.append(batch)
-                batch, used = [], 0
-            batch.append(item)
-            used += text_len
+        for chunk, text in chunks:
+            for item in _split_for_request(chunk, text, args.batch_chars):
+                text_len = len(item[1])
+                if batch and used + text_len > args.batch_chars:
+                    batches.append(batch)
+                    batch, used = [], 0
+                batch.append(item)
+                used += text_len
         if batch:
             batches.append(batch)
         good = []

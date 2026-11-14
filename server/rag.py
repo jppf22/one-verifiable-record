@@ -9,6 +9,9 @@ import httpx
 from config import settings
 from db import query
 
+MAX_RETRIEVAL_K = 20
+MAX_CONTEXT_CHARS = 24_000
+
 
 def _vec_literal(vec) -> str:
     return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
@@ -31,7 +34,7 @@ def embed_question(text: str) -> str | None:
 
 
 def retrieve(qid: str, question: str, lang: str | None = None, k: int | None = None):
-    k = k or settings.top_k
+    k = max(1, min(k or settings.top_k, MAX_RETRIEVAL_K))
     lang_filter = " AND a.lang = %s" if lang else ""
     lang_param = [lang] if lang else []
     vec = embed_question(question)
@@ -54,23 +57,35 @@ def retrieve(qid: str, question: str, lang: str | None = None, k: int | None = N
             return hits
     # lexical fallback: embedder unreachable, or this entity's chunks not embedded yet
     words = [w for w in question.split() if len(w) > 3][:6] or [question]
-    likes = " OR ".join(["ch.text LIKE %s"] * len(words))
+    # ``%`` and ``_`` are SQL LIKE wildcards. Escape them so a reader's literal
+    # query does not accidentally turn the fallback into a corpus-wide scan.
+    def like_term(word: str) -> str:
+        return "%" + word.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
+    likes = " OR ".join(["ch.text LIKE %s ESCAPE '!'"] * len(words))
     return query(
         f"""SELECT ch.id, ch.text, a.lang, a.title, a.revision_id
             FROM chunks ch
             JOIN articles a ON a.id = ch.article_id
             WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter} AND ({likes})
             LIMIT %s""",
-        tuple([qid] + lang_param + [f"%{w}%" for w in words] + [k]),
+        tuple([qid] + lang_param + [like_term(w) for w in words] + [k]),
     )
 
 
 def synthesize(question: str, hits) -> str | None:
     if not settings.verda_api_key or not hits:
         return None
-    context = "\n\n".join(
-        f"[{h['lang']}] {h['title']} (rev {h['revision_id']}):\n{h['text']}" for h in hits
-    )
+    excerpts, used = [], 0
+    for hit in hits:
+        header = f"[{hit['lang']}] {hit['title']} (rev {hit['revision_id']}):\n"
+        remaining = MAX_CONTEXT_CHARS - used - len(header)
+        if remaining <= 0:
+            break
+        text = (hit["text"] or "")[:remaining]
+        excerpts.append(header + text)
+        used += len(header) + len(text) + 2
+    context = "\n\n".join(excerpts)
     try:
         r = httpx.post(
             f"{settings.verda_base_url}/chat/completions",
@@ -78,6 +93,7 @@ def synthesize(question: str, hits) -> str | None:
             json={
                 "model": settings.llm_model,
                 "temperature": 0,
+                "reasoning_effort": settings.llm_reasoning_effort,
                 "messages": [
                     {
                         "role": "system",

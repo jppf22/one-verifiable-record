@@ -58,43 +58,52 @@ class HttpEncoder:
         # prefixes are already applied by run(), so the service keeps them as-is
         r = self.http.post(f"{self.url}/embeddings", json={"model": self.model, "input": texts})
         r.raise_for_status()
-        return [d["embedding"] for d in sorted(r.json()["data"], key=lambda d: d["index"])]
+        data = sorted(r.json().get("data", []), key=lambda d: d["index"])
+        if len(data) != len(texts) or [d["index"] for d in data] != list(range(len(texts))):
+            raise RuntimeError("embedder returned an incomplete or out-of-order batch")
+        return [d["embedding"] for d in data]
+
+    def close(self):
+        self.http.close()
 
 
 def run(model, table: str, batch_size: int, limit: int, model_name: str = ""):
     conn = connect()
-    cur = conn.cursor()
-    text_col, emb_table, fk = EMB_TABLES[table]
-    total, started = 0, time.time()
-    while True:
-        cur.execute(
-            f"SELECT t.id, t.{text_col} FROM {table} t "
-            f"LEFT JOIN {emb_table} e ON e.{fk} = t.id "
-            f"WHERE e.{fk} IS NULL ORDER BY t.id LIMIT %s",
-            (batch_size,),
-        )
-        rows = cur.fetchall()
-        if not rows:
-            break
-        texts = [PREFIX[table] + (r[1] or "") for r in rows]
-        embs = model.encode(
-            texts, batch_size=batch_size, normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        for (row_id, _text), emb in zip(rows, embs):
+    try:
+        cur = conn.cursor()
+        text_col, emb_table, fk = EMB_TABLES[table]
+        total, started = 0, time.time()
+        while True:
+            take = min(batch_size, limit - total) if limit else batch_size
             cur.execute(
-                f"INSERT INTO {emb_table} ({fk}, embedding, model) "
-                f"VALUES (%s, VEC_FromText(%s), %s) "
-                f"ON DUPLICATE KEY UPDATE embedding = VALUES(embedding), model = VALUES(model)",
-                (row_id, vec_literal(emb), model_name or None),
+                f"SELECT t.id, t.{text_col} FROM {table} t "
+                f"LEFT JOIN {emb_table} e ON e.{fk} = t.id "
+                f"WHERE e.{fk} IS NULL ORDER BY t.id LIMIT %s",
+                (take,),
             )
-        conn.commit()
-        total += len(rows)
-        rate = total / max(time.time() - started, 1e-6)
-        print(f"{table}: embedded {total} rows ({rate:.0f} rows/s)", file=sys.stderr)
-        if limit and total >= limit:
-            break
-    return total
+            rows = cur.fetchall()
+            if not rows:
+                return total
+            texts = [PREFIX[table] + (r[1] or "") for r in rows]
+            embs = model.encode(
+                texts, batch_size=batch_size, normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            if len(embs) != len(rows):
+                raise RuntimeError("encoder returned an incomplete batch")
+            for (row_id, _text), emb in zip(rows, embs):
+                cur.execute(
+                    f"INSERT INTO {emb_table} ({fk}, embedding, model) "
+                    f"VALUES (%s, VEC_FromText(%s), %s) "
+                    f"ON DUPLICATE KEY UPDATE embedding = VALUES(embedding), model = VALUES(model)",
+                    (row_id, vec_literal(emb), model_name or None),
+                )
+            conn.commit()
+            total += len(rows)
+            rate = total / max(time.time() - started, 1e-6)
+            print(f"{table}: embedded {total} rows ({rate:.0f} rows/s)", file=sys.stderr)
+    finally:
+        conn.close()
 
 
 def main():
@@ -107,6 +116,10 @@ def main():
                     help="use the embedder service (e.g. http://embedder:8001/v1) instead of "
                          "loading the model in-process")
     args = ap.parse_args()
+    if args.batch_size <= 0:
+        ap.error("--batch-size must be greater than zero")
+    if args.limit < 0:
+        ap.error("--limit cannot be negative")
 
     if args.endpoint:
         print(f"Using embedder service: {args.endpoint}", file=sys.stderr)
@@ -116,11 +129,16 @@ def main():
         print(f"Loading model: {args.model}", file=sys.stderr)
         model = SentenceTransformer(args.model)
 
-    for table in [t.strip() for t in args.tables.split(",") if t.strip()]:
-        if table not in ("chunks", "claims"):
-            sys.exit(f"unknown table: {table}")
-        total = run(model, table, args.batch_size, args.limit, args.model)
-        print(f"done: {table} ({total} rows)")
+    try:
+        for table in [t.strip() for t in args.tables.split(",") if t.strip()]:
+            if table not in ("chunks", "claims"):
+                sys.exit(f"unknown table: {table}")
+            total = run(model, table, args.batch_size, args.limit, args.model)
+            print(f"done: {table} ({total} rows)")
+    finally:
+        close = getattr(model, "close", None)
+        if close:
+            close()
 
 
 if __name__ == "__main__":

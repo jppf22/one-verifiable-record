@@ -1,5 +1,5 @@
 """QID-scoped embedding jobs dispatched to the configured embedding worker."""
-import json
+import math
 
 import httpx
 
@@ -7,6 +7,7 @@ from config import settings
 from db import get_conn, query
 
 BATCH_SIZE = 64
+EMBEDDING_DIMENSIONS = 1024
 
 
 def _vec_literal(vector) -> str:
@@ -27,10 +28,27 @@ def _encode(texts: list[str], input_type: str) -> list[list[float]]:
         timeout=300,
     )
     response.raise_for_status()
-    data = sorted(response.json().get("data", []), key=lambda item: item["index"])
-    if len(data) != len(texts):
+    try:
+        data = response.json().get("data", [])
+    except ValueError as exc:
+        raise RuntimeError("embedding worker returned invalid JSON") from exc
+    if not isinstance(data, list) or len(data) != len(texts):
         raise RuntimeError("embedding worker returned an incomplete batch")
-    return [item["embedding"] for item in data]
+    try:
+        data = sorted(data, key=lambda item: item["index"])
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("embedding worker returned malformed embedding metadata") from exc
+    if [item["index"] for item in data] != list(range(len(texts))):
+        raise RuntimeError("embedding worker returned invalid embedding indexes")
+    vectors = [item.get("embedding") for item in data]
+    if any(
+        not isinstance(vector, list)
+        or len(vector) != EMBEDDING_DIMENSIONS
+        or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in vector)
+        for vector in vectors
+    ):
+        raise RuntimeError("embedding worker returned invalid embedding vectors")
+    return vectors
 
 
 def _pending(qid: str, table: str) -> list[dict]:

@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 ARG EMBED_MODEL=intfloat/multilingual-e5-large
-ENV EMBED_MODEL=${EMBED_MODEL} HF_HOME=/models
+ENV EMBED_MODEL=${EMBED_MODEL} HF_HOME=/models REQUIRE_EMBED_API_TOKEN=1
 RUN python -c "import os; from sentence_transformers import SentenceTransformer as S; S(os.environ['EMBED_MODEL'])"
 COPY app.py .
 EXPOSE 8001
