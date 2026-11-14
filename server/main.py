@@ -14,6 +14,8 @@ with its counterpart pages (page_links). Endpoints (see /docs):
                                            only_here / possible match / agree)
   POST /api/pages/{id}/recheck             re-check; body (optional)
                                            {"focus_link_ids": [...]}
+  POST /api/claims/clean-invalid-links      cleanup mismatched predicate links
+  POST /api/pages/{id}/clean-links          cleanup invalid links for page
   GET  /api/pages/{id}/suggestions         generate (deduplicated) + list drafts
   POST /api/suggestions/{id}/export        mark a draft exported, then re-check
   GET  /api/claims/{id}/history            biography of a claim + its links and
@@ -132,9 +134,11 @@ def page_detail(page_id: int):
 def align_page(page_id: int):
     """Align this page's claims with its counterpart pages, then grade the links."""
     _page_or_404(page_id)
+    # Clean up any invalid links for this page before re-aligning
+    cleaned = alignment.clean_invalid_links(page_id)
     counts = alignment.align_page(page_id)
     verdict_counts = verdicts.run_verdicts(page_id)
-    return {"page_id": page_id, **counts, "verdicts": verdict_counts}
+    return {"page_id": page_id, **counts, "verdicts": verdict_counts, "cleaned_invalid_links": cleaned}
 
 
 @app.get("/api/pages/{page_id}/compare")
@@ -154,6 +158,21 @@ def recheck_page(page_id: int, body: Optional[RecheckRequest] = None):
     """Re-run alignment + grading for this page and report what resurfaced."""
     _page_or_404(page_id)
     return recheck.recheck_page(page_id, body.focus_link_ids if body else [])
+
+
+@app.post("/api/claims/clean-invalid-links")
+def clean_invalid_links():
+    """Remove all claim_links with mismatched predicates (one-time cleanup)."""
+    cleaned = alignment.clean_invalid_links()
+    return {"cleaned": cleaned, "message": f"Removed {cleaned} invalid claim links"}
+
+
+@app.post("/api/pages/{page_id}/clean-links")
+def clean_page_links(page_id: int):
+    """Remove invalid claim_links for a specific page."""
+    _page_or_404(page_id)
+    cleaned = alignment.clean_invalid_links(page_id)
+    return {"page_id": page_id, "cleaned": cleaned, "message": f"Removed {cleaned} invalid claim links for page {page_id}"}
 
 
 @app.get("/api/pages/{page_id}/suggestions")
@@ -269,6 +288,7 @@ def _annotation_claim(claim: dict) -> dict:
         "text": claim.get("statement_text") or "",
         "context": claim.get("context_text") or "",
         "value": claim.get("value_text") or claim.get("value_normalized") or "",
+        "kind": claim.get("kind") or "factoid",
         "predicate": claim.get("predicate") or "claim",
         "revision_id": claim.get("revision_id"),
         "revision_url": claim.get("url"),
@@ -291,13 +311,17 @@ def _annotation_link(link: dict, claim_ids: set[int]) -> dict:
 def _annotation_payload(view: dict) -> tuple[list, list]:
     """Project comparison rows to local marks and overlay-only missing rows."""
     annotations, missing_here = [], []
-    annotatable = {"conflict", "possible_conflict", "only_here", "possible_match"}
+    # Every row that has at least one local claim is annotatable so the overlay
+    # can mark all claims by type, including verified ones. "missing_here" rows
+    # have no local claim and stay in the overlay-only list below.
+    annotatable = {"conflict", "possible_conflict", "only_here", "possible_match", "agree"}
     for row in view["rows"]:
         status = row["status"]
         counterparts = [_annotation_claim(c) for claims in row["there"].values() for c in claims]
         if status == "missing_here":
             missing_here.append({
                 "row_key": row["key"], "status": status,
+                "kind": row.get("kind") or "factoid",
                 "predicate": row.get("predicate") or "claim",
                 "counterparts": counterparts,
                 "links": [_annotation_link(link, set()) for link in row["links"]],
@@ -312,6 +336,7 @@ def _annotation_payload(view: dict) -> tuple[list, list]:
             annotations.append({
                 "row_key": row["key"],
                 "status": status,
+                "kind": local.get("kind") or row.get("kind") or "factoid",
                 "claim": _annotation_claim(local),
                 "counterparts": counterparts,
                 "links": [_annotation_link(link, {local_id}) for link in links],
