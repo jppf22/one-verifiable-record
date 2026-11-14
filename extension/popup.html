@@ -9,6 +9,8 @@
     .row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
     button { padding: 5px 12px; }
     #status { margin-left: 8px; color: #137333; }
+    #status.error { color: #b32424; display: block; margin: 8px 0 0; }
+    .note { color: #54595d; line-height: 1.4; margin: 10px 0 0; }
   </style>
 </head>
 <body>
@@ -16,17 +18,17 @@
   <label>API base URL
     <input type="text" id="apiBase">
   </label>
-  <label>Web merge view URL
+  <label>Web app URL (comparison view)
     <input type="text" id="webBase">
   </label>
   <div class="row">
     <label style="margin:0">
       <input type="checkbox" id="enabled"> Badge enabled
     </label>
-    <span>
-      <button id="save">Save</button><span id="status"></span>
-    </span>
+    <button id="save">Save</button>
   </div>
+  <div id="status" role="status" aria-live="polite"></div>
+  <p class="note">The badge appears only on tracked fi, sv and en article pages. Findings refer to the imported source revision.</p>
   <script src="popup.js"></script>
 </body>
 </html>

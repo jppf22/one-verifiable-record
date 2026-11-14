@@ -15,6 +15,7 @@
 }
 
 .ovr-ok { background: #e6f4ea; color: #137333; }
+.ovr-warn { background: #fef7e0; color: #b06000; }
 .ovr-alert { background: #fce8e6; color: #c5221f; }
 
 .ovr-link { color: #3366cc; text-decoration: none; }

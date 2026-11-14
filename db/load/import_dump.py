@@ -5,11 +5,12 @@ Sources:
   https://github.com/MariaDB/mariadb-wikipedia-datasets
   https://github.com/MariaDB/mariadb-vector-wikipedia-rag  (fi/sv/en starter)
 
-The loader walks --data-dir for ``*.jsonl`` files whose records contain at
-least ``lang`` / ``title`` / ``text`` plus optional ``page_id``, ``qid`` (or
-``wikidata_qid``), ``revision_id``, ``section``, and for the official
-``articles-<lang>.parquet`` files of the MariaDB Wikipedia datasets. If the
-layout differs otherwise, adapt ``iter_records`` — it is deliberately the only
+The loader walks --data-dir for ``articles-{lang}.parquet`` files (the format
+of mariadb-vector-wikipedia-rag: lang, page_id, rev_id, wikidata_id, title, url,
+date_modified, text) and for ``*.jsonl`` files whose records contain at least
+``lang`` / ``title`` / ``text`` plus optional ``page_id``, ``qid`` (or
+``wikidata_qid``), ``revision_id``, ``section``. If the downloaded dataset
+layout differs, adapt ``iter_records`` — it is deliberately the only
 format-coupled function in the file.
 
 Embeddings are NOT computed here: run ``jobs/embed.py`` afterwards.
@@ -25,7 +26,6 @@ import re
 import sys
 
 import mariadb
-import pyarrow.parquet as pq
 
 TARGET_CHUNK_CHARS = 1200
 SPLIT_RE = re.compile(r"\n\n+")
@@ -60,32 +60,79 @@ def split_chunks(text: str):
     return parts or [""]
 
 
-def iter_records(data_dir: str):
+def replace_article_material(cur, article_id: int):
+    """Replace an article safely when a newer dump is imported.
+
+    Claims and verdicts are derived from a specific revision's chunks. Keeping
+    them after a chunk replacement would be worse than removing them; the
+    decision tables are system-versioned, so their prior state remains auditable.
+    """
+    cur.execute("SELECT id FROM claims WHERE article_id = %s", (article_id,))
+    claim_ids = [row[0] for row in cur.fetchall()]
+    if claim_ids:
+        marks = ",".join(["%s"] * len(claim_ids))
+        cur.execute(
+            f"UPDATE suggestions SET claim_link_id = NULL WHERE claim_link_id IN "
+            f"(SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks}))",
+            tuple(claim_ids + claim_ids),
+        )
+        cur.execute(
+            f"DELETE FROM reviews WHERE claim_link_id IN "
+            f"(SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks}))",
+            tuple(claim_ids + claim_ids),
+        )
+        cur.execute(
+            f"DELETE FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks})",
+            tuple(claim_ids + claim_ids),
+        )
+        cur.execute(f"DELETE FROM claim_embeddings WHERE claim_id IN ({marks})", tuple(claim_ids))
+        cur.execute(f"DELETE FROM claims WHERE id IN ({marks})", tuple(claim_ids))
+    cur.execute("SELECT id FROM chunks WHERE article_id = %s", (article_id,))
+    chunk_ids = [row[0] for row in cur.fetchall()]
+    if chunk_ids:
+        marks = ",".join(["%s"] * len(chunk_ids))
+        cur.execute(f"DELETE FROM chunk_embeddings WHERE chunk_id IN ({marks})", tuple(chunk_ids))
+    cur.execute("DELETE FROM chunks WHERE article_id = %s", (article_id,))
+
+
+PARQUET_RE = re.compile(r"^articles-(fi|sv|en)\.parquet$")
+
+
+def _from_parquet(rec: dict) -> dict:
+    """Map the RAG starter's parquet columns onto the loader's record shape."""
+    return {
+        "lang": rec.get("lang"),
+        "title": rec.get("title"),
+        "text": rec.get("text") or "",
+        "page_id": rec.get("page_id"),
+        "qid": rec.get("wikidata_id"),
+        "revision_id": rec.get("rev_id"),
+    }
+
+
+def iter_records(data_dir: str, langs=None):
+    seen = set()  # the same parquet file may exist in several cloned repos
     for root, _dirs, files in os.walk(data_dir):
+        if "/.git" in root:
+            continue
         for fname in sorted(files):
-            path = os.path.join(root, fname)
-            if fname.endswith(".jsonl"):
-                with open(path, encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if line:
-                            yield json.loads(line)
-            elif fname.startswith("articles-") and fname.endswith(".parquet"):
-                # MariaDB Wikipedia datasets (S/M/L releases and the
-                # mariadb-vector-wikipedia-rag starter) ship per-language
-                # parquet: lang, page_id, rev_id, wikidata_id, title, url,
-                # date_modified, text.
-                for batch in pq.ParquetFile(path).iter_batches(batch_size=500):
+            m = PARQUET_RE.match(fname)
+            if m:
+                if fname in seen or (langs and m.group(1) not in langs):
+                    continue
+                seen.add(fname)
+                import pyarrow.parquet as pq  # only needed for parquet input
+                for batch in pq.ParquetFile(os.path.join(root, fname)).iter_batches(batch_size=500):
                     for rec in batch.to_pylist():
-                        yield {
-                            "lang": rec.get("lang"),
-                            "title": rec.get("title"),
-                            "text": rec.get("text"),
-                            "page_id": rec.get("page_id"),
-                            "qid": rec.get("wikidata_id"),
-                            "revision_id": rec.get("rev_id"),
-                            "section": None,
-                        }
+                        yield _from_parquet(rec)
+                continue
+            if not fname.endswith(".jsonl"):
+                continue
+            with open(os.path.join(root, fname), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
 
 
 def main():
@@ -93,16 +140,30 @@ def main():
     ap.add_argument("--data-dir", default="db/load/data")
     ap.add_argument("--size", default="small", choices=["small", "medium", "large"],
                     help="dataset preset; used only for progress reporting so far")
+    ap.add_argument("--langs", default="fi,sv,en", help="comma-separated languages to import")
+    ap.add_argument("--only-shared", action="store_true",
+                    help="only import articles whose Wikidata QID exists in 2+ selected languages "
+                         "(the merge view needs at least two editions)")
     args = ap.parse_args()
+    langs = set(args.langs.split(","))
+
+    shared = None
+    if args.only_shared:
+        from collections import Counter
+        qids = Counter(r["qid"] for r in iter_records(args.data_dir, langs) if r.get("qid"))
+        shared = {q for q, n in qids.items() if n >= 2}
+        print(f"{len(shared)} QIDs exist in 2+ languages", file=sys.stderr)
 
     conn = connect()
     cur = conn.cursor()
     n_articles = n_chunks = 0
 
-    for rec in iter_records(args.data_dir):
+    for rec in iter_records(args.data_dir, langs):
         lang = rec.get("lang")
         title = rec.get("title")
         if not lang or not title:
+            continue
+        if shared is not None and rec.get("qid") not in shared:
             continue
         page_id = int(rec.get("page_id") or 0)
         if not page_id:
@@ -123,8 +184,9 @@ def main():
         cur.execute("SELECT id FROM articles WHERE lang = %s AND page_id = %s", (lang, page_id))
         (article_id,) = cur.fetchone()
 
-        # re-import is idempotent: replace the article's chunks
-        cur.execute("DELETE FROM chunks WHERE article_id = %s", (article_id,))
+        # Re-import is revision-safe: invalidate all derived material before
+        # changing its source chunks, while keeping system-versioned history.
+        replace_article_material(cur, article_id)
         for idx, chunk in enumerate(split_chunks(rec.get("text", ""))):
             cur.execute(
                 """INSERT INTO chunks (article_id, chunk_idx, section, text, revision_id)
@@ -138,8 +200,24 @@ def main():
             conn.commit()
             print(f"... {n_articles} articles, {n_chunks} chunks", file=sys.stderr)
 
+    # Materialise current high-confidence counterparts from the imported
+    # Wikidata sitelinks. The comparison API reads page_links—not a QID—so this
+    # one import-time operation gives all layers a concrete, refreshable page
+    # relationship. Other discovery sources can add lower-confidence rows with
+    # their own provenance without changing the comparison engine.
+    cur.execute(
+        """INSERT INTO page_links (page_a, page_b, source, confidence, evidence)
+           SELECT a.id, b.id, 'wikidata_sitelink', 1.0,
+                  JSON_OBJECT('qid', a.wikidata_qid)
+           FROM articles a
+           JOIN articles b ON b.wikidata_qid = a.wikidata_qid AND b.id <> a.id
+           WHERE a.wikidata_qid IS NOT NULL
+           ON DUPLICATE KEY UPDATE source = VALUES(source), confidence = VALUES(confidence),
+             evidence = VALUES(evidence), verified_at = CURRENT_TIMESTAMP"""
+    )
+    n_links = cur.rowcount
     conn.commit()
-    print(f"Imported {n_articles} articles, {n_chunks} chunks (preset: {args.size}).")
+    print(f"Imported {n_articles} articles, {n_chunks} chunks, {n_links} counterpart links (preset: {args.size}).")
     print("Next step: python jobs/embed.py")
 
 

@@ -16,7 +16,7 @@ services:
     ports:
       - "127.0.0.1:3306:3306"
     healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_buffer_pool_size"]
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -31,14 +31,25 @@ services:
       DATABASE_PASSWORD: ${MARIADB_PASSWORD:-ovr_pass}
       DATABASE_NAME: ${MARIADB_DATABASE:-wikipedia}
       VERDA_API_KEY: ${VERDA_API_KEY:-}
-      VERDA_BASE_URL: ${VERDA_BASE_URL:-https://api.verda.com/v1}
-      LLM_MODEL: ${LLM_MODEL:-kimi-k3.1-pro}
+      VERDA_BASE_URL: ${VERDA_BASE_URL:-https://inference.verda.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-kimi-k3-1-pro}
       EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-http://embedder:8001/v1}
     depends_on:
       mariadb:
         condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  embedder:
+    build: ./embedder
+    container_name: ovr-embedder
+    environment:
+      EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+      OMP_NUM_THREADS: ${EMBED_THREADS:-3}
+    ports:
+      - "127.0.0.1:8001:8001"
     restart: unless-stopped
 
   web:

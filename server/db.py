@@ -39,3 +39,17 @@ def execute(sql, params=()):
         cur.execute(sql, params)
         conn.commit()
         return cur.rowcount
+
+
+def insert(sql, params=()):
+    """Run an INSERT and return the new row id (AUTO_INCREMENT)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
+
+
+def placeholders(values) -> str:
+    """'%s, %s, ...' for an IN (...) list. Callers must ensure values is non-empty."""
+    return ", ".join(["%s"] * len(values))

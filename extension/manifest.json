@@ -1,12 +1,18 @@
 {
   "manifest_version": 3,
   "name": "One Verifiable Record",
-  "version": "0.1.0",
-  "description": "Cross-language consistency badge for Wikipedia articles. See how the fi/sv/en editions agree or conflict, and jump to the merge view.",
+  "version": "0.2.3",
+  "description": "Shows precomputed cross-language comparison findings for tracked Finnish, Swedish and English Wikipedia articles.",
   "permissions": ["storage"],
   "host_permissions": [
-    "https://*.wikipedia.org/*",
-    "http://localhost:8000/*"
+    "https://fi.wikipedia.org/*",
+    "https://sv.wikipedia.org/*",
+    "https://en.wikipedia.org/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -16,9 +22,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://*.wikipedia.org/wiki/*"],
+      "matches": [
+        "https://fi.wikipedia.org/*",
+        "https://sv.wikipedia.org/*",
+        "https://en.wikipedia.org/*"
+      ],
       "js": ["content.js"],
-      "css": ["styles.css"],
       "run_at": "document_idle"
     }
   ]

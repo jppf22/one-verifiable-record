@@ -22,7 +22,7 @@ link back into Wikipedia.
 | Grounded Q&A (RAG track) | The same vector index over article chunks; answers cite per-language sources |
 | Human-in-the-loop review | Review console to confirm/fix verdicts; every decision is itself versioned |
 | Patch generation | Per-language proposed wikitext edits / talk-page drafts, one-click export (never automated editing) |
-| Wikipedia companion extension | Manifest V3 consistency badge + deep links on live Wikipedia articles |
+| Wikipedia companion extension | Snapshot-safe inline claim annotations, findings tray, receipts and focused comparison deep links on live Wikipedia articles |
 
 ## Architecture
 
@@ -59,6 +59,23 @@ python db/load/import_dump.py --data-dir db/load/data
 pip install -r jobs/requirements.txt
 python jobs/embed.py          # CPU is fine for the small dataset
 ```
+
+### Full-page comparison refresh
+
+The extractor processes every imported article chunk, retaining entity IDs,
+typed canonical values, qualifiers, source context and citation identifiers.
+For an existing database, apply
+[`db/migrations/001_page_links.sql`](db/migrations/001_page_links.sql) and then
+[`db/migrations/002_richer_claim_comparison.sql`](db/migrations/002_richer_claim_comparison.sql)
+before deploying this revision. Then re-import the current dump, run
+`python jobs/extract_claims.py --all-trilingual --reextract`, re-embed claims,
+and align the pages. `--reextract` deliberately replaces active derived rows;
+their system-versioned history remains available for audit.
+
+Candidate generation is intentionally broad (12 nearest claims per counterpart
+and a relaxed vector distance). The comparison view distinguishes confirmed
+conflicts from **possible conflicts** and **possible matches**, so an uncertain
+alignment is visible rather than being silently represented as two gaps.
 
 Open http://localhost:8080 (merge view) or http://localhost:8000/docs (API reference).
 
