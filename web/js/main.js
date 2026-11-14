@@ -2,6 +2,7 @@
 import { $, esc, getReviewer, setReviewer } from "./util.js";
 import * as router from "./router.js";
 import * as search from "./search.js";
+import * as discovery from "./discovery.js";
 import * as merge from "./merge.js";
 import * as review from "./review.js";
 import * as keyboard from "./keyboard.js";
@@ -54,6 +55,7 @@ function safeInit(name, mod) {
 router.init();
 initReviewerChip();
 safeInit("search", search);
+safeInit("discovery", discovery);
 safeInit("merge", merge);
 safeInit("review", review);
 safeInit("keyboard", keyboard);

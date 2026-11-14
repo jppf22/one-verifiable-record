@@ -96,6 +96,23 @@ kbd {
 .legend li { display: flex; align-items: center; gap: 10px; color: var(--muted); }
 .legend .badge { min-width: 86px; text-align: center; }
 
+/* ---------- discovery ---------- */
+#discovery { margin: 22px 0; }
+.discovery-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.discovery-section { min-width: 0; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+.discovery-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.discovery-heading h2 { margin: 0; font-size: 16px; }
+.discovery-heading p { margin: 0; text-align: right; }
+.discover-list { display: grid; gap: 6px; }
+.discover-card { width: 100%; min-width: 0; padding: 8px 10px; text-align: left; display: grid; gap: 3px; }
+.discover-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+.discover-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; color: var(--muted); font-size: 12px; }
+.discover-editions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 2px 5px; }
+.discover-editions .lang-tag { margin-right: 0; font-size: 10px; min-width: 0; }
+.conflict-count { color: var(--bad); font-weight: 700; }
+.topic-type { color: var(--accent); font-weight: 700; }
+.discover-empty, .discovery-loading { margin: 8px 0; }
+
 /* ---------- search ---------- */
 #search-form { display: flex; gap: 8px; margin-top: 4px; }
 .search-box { position: relative; flex: 1; min-width: 0; }
@@ -171,6 +188,9 @@ dialog th, dialog td { text-align: left; padding: 6px 8px; border-bottom: 1px so
   main { padding: 8px 14px 48px; }
   h1 { font-size: 21px; }
   #search-form button[type="submit"] { display: none; }
+  .discovery-grid { grid-template-columns: 1fr; }
+  .discovery-heading { display: block; }
+  .discovery-heading p { text-align: left; margin-top: 2px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

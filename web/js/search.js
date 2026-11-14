@@ -44,7 +44,13 @@ function group(rows) {
   for (const r of rows) {
     const key = r.wikidata_qid || `article-${r.id}`;
     if (!byQid.has(key)) byQid.set(key, { qid: r.wikidata_qid, editions: [] });
-    byQid.get(key).editions.push(r);
+    // Newer servers already return one entity with nested editions.  Keep this
+    // tolerant of the legacy flat response while never rendering an entity twice.
+    const editions = Array.isArray(r.editions) && r.editions.length ? r.editions : [r];
+    const target = byQid.get(key).editions;
+    for (const edition of editions) {
+      if (!target.some((known) => known.id === edition.id)) target.push(edition);
+    }
   }
   const order = (l) => { const i = LANGS.indexOf(l); return i < 0 ? 99 : i; };
   for (const g of byQid.values()) g.editions.sort((a, b) => order(a.lang) - order(b.lang));

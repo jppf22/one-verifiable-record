@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     match_distance: float = 0.35
     nearest_k: int = 3
     top_k: int = 8
+    # Public demo protection. The web app proxies /api, so these limits cover
+    # browser writes without putting a costly LLM endpoint directly on port 8000.
+    post_rate_limit_per_minute: int = 12
 
 
 settings = Settings()

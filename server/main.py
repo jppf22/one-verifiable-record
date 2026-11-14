@@ -21,9 +21,13 @@ Endpoints (see /docs for the interactive reference):
 
 The full request/response shapes live in docs/frontend-contract.md.
 """
+from collections import defaultdict, deque
+from threading import Lock
+from time import monotonic
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -46,6 +50,33 @@ app.add_middleware(
 )
 
 
+# Alignment and re-checks can make multiple inference calls. This modest,
+# in-process limiter is deliberately a safety net for a public demo, not a
+# substitute for account-level authentication in a multi-user deployment.
+_post_windows: dict[str, deque[float]] = defaultdict(deque)
+_post_lock = Lock()
+
+
+@app.middleware("http")
+async def limit_costly_writes(request: Request, call_next):
+    if request.method != "POST" or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    # The only public path is nginx, which sets this header. Direct API access
+    # is loopback-only in compose, so it is safe to use the forwarded address.
+    client = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+    now = monotonic()
+    with _post_lock:
+        window = _post_windows[client]
+        while window and now - window[0] >= 60:
+            window.popleft()
+        if len(window) >= settings.post_rate_limit_per_minute:
+            return JSONResponse(
+                {"detail": "Too many write requests; try again in a minute."}, status_code=429,
+            )
+        window.append(now)
+    return await call_next(request)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -53,23 +84,133 @@ def health():
 
 @app.get("/api/articles")
 def search_articles(q: str = Query(min_length=2), limit: int = 25):
-    """Search tracked articles that are aligned across languages (have a QID)."""
+    """Search tracked entities, returning exactly one result per Wikidata QID.
+
+    Editions are nested beneath their shared entity rather than consuming separate
+    result slots.  This matters for a three-language corpus: limiting rows before
+    grouping made a search for a common title look like it contained duplicate pages.
+    """
+    limit = max(1, min(limit, 100))
     rows = query(
         """SELECT a.id, a.lang, a.title, a.wikidata_qid, a.revision_id
            FROM articles a
-           WHERE a.title LIKE %s AND a.wikidata_qid IS NOT NULL
-           ORDER BY a.title
-           LIMIT %s""",
+           JOIN (
+             SELECT wikidata_qid, MIN(title) AS match_title
+             FROM articles
+             WHERE title LIKE %s AND wikidata_qid IS NOT NULL
+             GROUP BY wikidata_qid
+             ORDER BY MIN(title), wikidata_qid
+             LIMIT %s
+           ) matches ON matches.wikidata_qid = a.wikidata_qid
+           ORDER BY matches.match_title, matches.wikidata_qid,
+                    CASE a.lang WHEN 'en' THEN 0 WHEN 'fi' THEN 1 WHEN 'sv' THEN 2 ELSE 3 END,
+                    a.title""",
         (f"%{q}%", limit),
     )
-    # collapse to one row per Wikidata entity (first title wins)
-    seen, out = set(), []
+    grouped = defaultdict(list)
     for r in rows:
-        if r["wikidata_qid"] in seen:
-            continue
-        seen.add(r["wikidata_qid"])
-        out.append(r)
+        grouped[r["wikidata_qid"]].append(r)
+
+    out = []
+    for qid, editions in grouped.items():
+        # The English title is usually the most recognisable display title.  The
+        # complete edition list keeps searches in Finnish and Swedish discoverable.
+        primary = next((e for e in editions if e["lang"] == "en"), editions[0]).copy()
+        primary["editions"] = editions
+        out.append(primary)
     return out
+
+
+PERSON_PREDICATES = {
+    "birth_date", "birth_place", "death_date", "death_place", "spouse",
+    "occupation", "office_held", "parent", "child",
+}
+PLACE_PREDICATES = {"population", "area", "area_km2", "elevation", "located_in", "coordinates"}
+ORGANIZATION_PREDICATES = {"founded", "headquarters", "parent_organization", "subsidiary"}
+EVENT_PREDICATES = {"start_date", "end_date", "outcome", "participants", "location"}
+WORK_PREDICATES = {"author", "director", "release_date", "publisher", "genre"}
+
+
+def _topic_type(predicates: set[str]) -> str:
+    """A deliberately conservative label for browse cards, not a Wikidata assertion."""
+    if predicates & PLACE_PREDICATES:
+        return "Place"
+    if predicates & ORGANIZATION_PREDICATES:
+        return "Organization"
+    if predicates & EVENT_PREDICATES:
+        return "Event"
+    if predicates & WORK_PREDICATES:
+        return "Work"
+    return "Topic"
+
+
+@app.get("/api/discover")
+def discover_articles(limit: int = Query(8, ge=1, le=20)):
+    """Return one-card-per-page discovery lists from the imported corpus.
+
+    ``high_conflicts`` is ranked by distinct contradicted claim links; ``diverse``
+    deliberately excludes pages with clear biography predicates, so the landing
+    page is not just a roster of people.
+    """
+    rows = query(
+        """SELECT a.wikidata_qid,
+                  MAX(CASE WHEN a.lang = 'en' THEN a.title END) AS english_title,
+                  MIN(a.title) AS fallback_title,
+                  COUNT(DISTINCT a.lang) AS edition_count,
+                  COUNT(DISTINCT c.id) AS claim_count,
+                  COUNT(DISTINCT CASE WHEN cl.verdict = 'contradicted' THEN cl.id END) AS conflict_count,
+                  GROUP_CONCAT(DISTINCT c.predicate SEPARATOR '|') AS predicates
+           FROM articles a
+           LEFT JOIN claims c ON c.article_id = a.id AND c.revision_id <=> a.revision_id
+           LEFT JOIN claim_links cl ON cl.claim_a = c.id
+           WHERE a.wikidata_qid IS NOT NULL
+           GROUP BY a.wikidata_qid
+           HAVING COUNT(DISTINCT a.lang) >= 2
+           ORDER BY conflict_count DESC, claim_count DESC, english_title, fallback_title
+           LIMIT 250"""
+    )
+    qids = [r["wikidata_qid"] for r in rows]
+    editions_by_qid = defaultdict(list)
+    if qids:
+        edition_rows = query(
+            f"""SELECT id, lang, title, wikidata_qid, revision_id FROM articles
+                WHERE wikidata_qid IN ({placeholders(qids)})
+                ORDER BY wikidata_qid,
+                         CASE lang WHEN 'en' THEN 0 WHEN 'fi' THEN 1 WHEN 'sv' THEN 2 ELSE 3 END,
+                         title""",
+            tuple(qids),
+        )
+        for edition in edition_rows:
+            editions_by_qid[edition["wikidata_qid"]].append(edition)
+
+    cards = []
+    for row in rows:
+        predicates = {p for p in (row.get("predicates") or "").split("|") if p}
+        editions = editions_by_qid[row["wikidata_qid"]]
+        cards.append({
+            "qid": row["wikidata_qid"],
+            "title": row["english_title"] or row["fallback_title"],
+            "editions": editions,
+            "conflicts": int(row["conflict_count"] or 0),
+            "claims": int(row["claim_count"] or 0),
+            "is_person": bool(predicates & PERSON_PREDICATES),
+            "topic_type": _topic_type(predicates),
+        })
+
+    high_conflicts = [card for card in cards if card["conflicts"] > 0][:limit]
+    # Keep the broadest labels represented before adding a second item of a type.
+    diverse, seen_types = [], set()
+    candidates = [card for card in cards if not card["is_person"]]
+    for card in candidates:
+        if card["topic_type"] not in seen_types:
+            diverse.append(card)
+            seen_types.add(card["topic_type"])
+            if len(diverse) == limit:
+                break
+    if len(diverse) < limit:
+        used = {card["qid"] for card in diverse}
+        diverse.extend(card for card in candidates if card["qid"] not in used)
+    return {"high_conflicts": high_conflicts, "diverse": diverse[:limit]}
 
 
 @app.get("/api/articles/by-title")
@@ -123,7 +264,11 @@ def badge(lang: str, title: str):
            FROM claim_links cl
            JOIN claims c ON c.id = cl.claim_a
            JOIN articles a ON a.id = c.article_id
+           JOIN claims other_c ON other_c.id = cl.claim_b
+           JOIN articles other_a ON other_a.id = other_c.article_id
            WHERE a.wikidata_qid = %s
+             AND c.revision_id <=> a.revision_id
+             AND other_c.revision_id <=> other_a.revision_id
            GROUP BY cl.verdict""",
         (row["wikidata_qid"],),
     )

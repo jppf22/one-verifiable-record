@@ -27,6 +27,7 @@ async function request(path, { method = "GET", body } = {}) {
 
 export const api = {
   searchArticles: (q) => request(`/articles?q=${enc(q)}`),
+  discover: () => request(`/discover`),
   align: (qid) => request(`/align/${enc(qid)}`, { method: "POST" }),
   merge: (qid) => request(`/merge/${enc(qid)}`),
   recheck: (qid, focusLinkIds = []) =>

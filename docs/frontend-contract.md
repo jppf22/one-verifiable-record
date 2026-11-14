@@ -6,14 +6,29 @@ coordinator.
 
 ## Endpoints (existing endpoints stay backwards compatible)
 
-### `GET /api/articles?q=` (unchanged)
-`[{id, lang, title, wikidata_qid, revision_id}]`
+### `GET /api/articles?q=` (one entity per result)
+`[{id, lang, title, wikidata_qid, revision_id, editions:[{id, lang, title, wikidata_qid, revision_id}]}]`
+
+The top-level fields identify the preferred display edition (English when present).
+`editions` contains every matching imported language edition. A QID appears only once;
+the `limit` applies to entities, not individual editions.
+
+### `GET /api/discover?limit=8` (new)
+```jsonc
+{
+  "high_conflicts": [{ "qid", "title", "editions", "conflicts", "claims", "topic_type" }],
+  "diverse": [{ "qid", "title", "editions", "conflicts", "claims", "topic_type" }]
+}
+```
+Both lists contain one item per QID. `high_conflicts` ranks distinct contradicted claim
+links. `diverse` excludes entities with clear biographical claim predicates and rotates
+through inferred topic types (Place, Organization, Event, Work, Topic).
 
 ### `GET /api/merge/{qid}` (extended, additive only)
 ```jsonc
 {
   "qid": "Q1757",
-  "articles": [{ "id", "lang", "title", "wikidata_qid", "revision_id",
+  "articles": [{ "id", "lang", "title", "wikidata_qid", "revision_id", "fetched_at",
                  "url": "https://fi.wikipedia.org/w/index.php?oldid=123" }],
   "summary": { "conflict": 3, "gap": 7, "agree": 12,
                "links_total": 30, "links_reviewed": 4 },
@@ -31,6 +46,8 @@ coordinator.
 }
 ```
 `review` is the **latest** review for that link. `url` is `null` when `revision_id` is null.
+`fetched_at` makes the snapshot age visible; a verdict applies to the imported revision,
+not necessarily the live article.
 
 ### `POST /api/reviews` (extended response)
 Body: `{claim_link_id, reviewer, decision: "agree"|"disagree"|"fix", note?}`
@@ -118,3 +135,6 @@ Panels expose `init()` in each module. `main.js` imports and calls them.
   Every entry in `links` has `regraded: true`. See assumptions S4.
 - (web-core) `recheck:done` may carry `linkIds` (the reviewed link). If a review response has
   no `recheck`, review.js emits `merge:reload` instead. See W4.
+- (server/web) Article search now groups editions server-side and adds `/api/discover` for
+  conflict-ranked and non-biographical discovery cards. The nested `editions` field is additive;
+  the web client accepts both this response and the prior flat response.

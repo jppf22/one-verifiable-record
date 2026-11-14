@@ -65,9 +65,11 @@ Assumed (coordinator):
   sides (symmetric claim-to-claim matching).
 - D9. The importer loads only articles whose QID exists in 2+ languages
   (`--only-shared`): 17,431 articles, 54,144 chunks.
-- D10. Known issue: re-import deletes and reinserts `chunks`, which fails once claims or
-  embeddings reference them (FKs). The A1 "re-import to resolve" story needs an upsert
-  re-import. Not built yet; see Q3.
+- D10. Refresh imports are append-only: a changed source text gets a new set of chunks,
+  while old chunks stay available to the claims/embeddings that cite them. Queries read
+  only rows matching `articles.revision_id`; after a refresh, extraction and claim
+  embedding run again for the new revision. `db/migrations/001_live_refresh.sql` upgrades
+  databases created before this behaviour.
 
 ## Assumed (extension)
 - X1. (extension) If the server's badge response has no `gaps` field (older server), the
@@ -141,6 +143,9 @@ Assumed (coordinator):
   something resurfaced. "Dismiss" also clears the sessionStorage cache for that QID.
 - W6. Only the `status` filter goes into the URL (`?status=conflict,gap`, via replaceState,
   so no extra history entries). The kind, text and unreviewed filters are per-session view state.
+- W7. Landing-page discovery is based only on imported claims. The "more topics" list excludes
+  pages with explicit biographical predicates and labels the remainder from conservative predicate
+  signals; it is a browse aid, not a claim about an entity's Wikidata type.
 
 ## Open questions for the owner
 - Q1. Should a human Disagree/Fix eventually **override** the machine verdict
@@ -149,7 +154,7 @@ Assumed (coordinator):
 - Q2. Should the re-check eventually fetch the **live** Wikipedia revision (MediaWiki API)
   so an applied patch can show "Resolved"? Today it uses the DB snapshot (A1), so
   conflicts resurface until a re-import.
-- Q3. Re-import with changed revisions (needed for a conflict to ever be "resolved",
-  A1): should new revisions **update claims in place**, so SVT keeps the old version
-  and the re-check sees them as stale, or be stored as **new articles/claims rows**?
-  Updating in place fits the SVT story best.
+- Q3. Should a later refresh identify semantically unchanged claims and update those
+  claim rows in place (a tighter System-Versioned Tables story), or retain the current
+  append-only claim rows per source revision? Today we choose append-only claims because
+  it never compromises the source chunk that a historic claim references.
