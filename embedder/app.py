@@ -8,15 +8,26 @@ E5 needs instruction prefixes. Pass "input_type": "query" (default) or
 "passage". Inputs that already start with "query: " / "passage: " are kept as-is.
 """
 import os
+import secrets
 from typing import List, Literal, Optional, Union
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-large")
+EMBED_API_TOKEN = os.environ.get("EMBED_API_TOKEN", "")
 model = SentenceTransformer(MODEL_NAME)
 app = FastAPI(title="OVR embedder")
+
+
+def _authorize(authorization: str | None):
+    """Require a bearer token when this service is hosted off the app VM."""
+    if not EMBED_API_TOKEN:
+        return
+    supplied = (authorization or "").removeprefix("Bearer ")
+    if not secrets.compare_digest(supplied, EMBED_API_TOKEN):
+        raise HTTPException(401, "invalid embedding worker token")
 
 
 class EmbedRequest(BaseModel):
@@ -35,7 +46,8 @@ def health():
 
 
 @app.post("/v1/embeddings")
-def embeddings(req: EmbedRequest):
+def embeddings(req: EmbedRequest, authorization: str | None = Header(default=None)):
+    _authorize(authorization)
     texts = [req.input] if isinstance(req.input, str) else req.input
     vecs = model.encode(
         [_prefixed(t or "", req.input_type) for t in texts],

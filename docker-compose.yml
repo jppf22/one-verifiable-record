@@ -14,6 +14,7 @@ services:
       - mariadb_data:/var/lib/mysql
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./db/migrations/001_live_refresh.sql:/docker-entrypoint-initdb.d/02_live_refresh.sql:ro
+      - ./db/migrations/002_open_claim_taxonomy.sql:/docker-entrypoint-initdb.d/03_open_claim_taxonomy.sql:ro
     ports:
       - "127.0.0.1:3306:3306"
     healthcheck:
@@ -34,8 +35,11 @@ services:
       VERDA_API_KEY: ${VERDA_API_KEY:-}
       VERDA_BASE_URL: ${VERDA_BASE_URL:-https://inference.verda.com/v1}
       LLM_MODEL: ${LLM_MODEL:-kimi-k3-1-pro}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
       EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
       EMBED_BASE_URL: ${EMBED_BASE_URL:-http://embedder:8001/v1}
+      GPU_EMBED_BASE_URL: ${GPU_EMBED_BASE_URL:-}
+      GPU_EMBED_TOKEN: ${GPU_EMBED_TOKEN:-}
     depends_on:
       mariadb:
         condition: service_healthy

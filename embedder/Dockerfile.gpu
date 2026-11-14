@@ -1,0 +1,16 @@
+# CUDA runtime supplied by Verda's GPU host. SentenceTransformers installs a
+# CUDA-enabled torch wheel from this image rather than the CPU-only base used
+# by the local development embedder.
+# Keep pace with the current Transformers package pulled by
+# sentence-transformers. Older CUDA PyTorch images fail while importing its
+# distributed helpers before the embedding model can load.
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+ARG EMBED_MODEL=intfloat/multilingual-e5-large
+ENV EMBED_MODEL=${EMBED_MODEL} HF_HOME=/models
+RUN python -c "import os; from sentence_transformers import SentenceTransformer as S; S(os.environ['EMBED_MODEL'])"
+COPY app.py .
+EXPOSE 8001
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001"]

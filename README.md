@@ -6,8 +6,9 @@ Junction 2026 · MariaDB challenge #307 ("Wikipedia Through Time")
 > Wikipedia's language editions are parallel branches of the same truth.
 > **One Verifiable Record is the merge tool.**
 
-Pick an article. We decompose the fi / sv / en editions into **atomic claims**, align them across
-languages with multilingual embeddings inside MariaDB, and render a **git-diff-style merge view**:
+Pick an article. We decompose every imported source chunk in its fi / sv / en editions into
+**atomic claims**, align them across languages with multilingual embeddings inside MariaDB, and
+render a **git-diff-style merge view**:
 what the editions agree on, where they contradict each other, and what one edition simply does not
 know yet. Every verdict ships with **receipts**: the source passage, the revision id, and a deep
 link back into Wikipedia.
@@ -16,7 +17,7 @@ link back into Wikipedia.
 
 | Feature | Implementation |
 | --- | --- |
-| Cross-language claim alignment | MariaDB vector search (`VEC_DISTANCE_COSINE`, HNSW index) over multilingual claim embeddings |
+| Cross-language claim alignment | Every extracted claim is searched in each other available language; dynamic predicate recall plus MariaDB vector search (`VEC_DISTANCE_COSINE`, HNSW index) over multilingual claim embeddings |
 | Verdicts with receipts | `supported` / `contradicted` / `unverifiable` + evidence passage, revision id, wiki link |
 | Claim provenance — "biography of a sentence" | MariaDB System-Versioned Tables (`claims`, `claim_links`, `reviews`, `suggestions`) |
 | Grounded Q&A (RAG track) | The same vector index over article chunks; answers cite per-language sources |
@@ -63,6 +64,36 @@ python jobs/embed.py --tables claims
 curl -X POST localhost:8000/api/align/Q12345
 ```
 
+Claim predicates are extractor-generated canonical relations, not an application
+allow-list. For existing data made with an older extractor, re-run extraction and
+embedding before interpreting coverage. For example, for a selected entity:
+
+```bash
+python jobs/extract_claims.py --qids Q12345 --replace-current
+python jobs/embed.py --tables claims
+curl -X POST localhost:8000/api/align/Q12345
+```
+
+`--replace-current` is deliberately scoped to the selected QIDs and records the
+prior system-versioned claim/link rows as history.
+
+### On-demand Verda GPU embeddings
+
+When `GPU_EMBED_BASE_URL` and `GPU_EMBED_TOKEN` point at the protected Verda
+worker, embed only the missing current claim vectors for one page:
+
+```bash
+# Run on the app VM (or use the public web origin's /api proxy).
+curl -X POST 'http://localhost:8000/api/embed/Q12345'
+```
+
+Add `?include_chunks=true` after an import to embed the page's RAG passages as
+well. The API sends text batches to the GPU worker but writes vectors through
+the app VM's existing MariaDB connection, so MariaDB is never exposed on the
+GPU VM. The worker is intentionally QID-scoped and GPU-billed while running;
+stop it with `verda vm shutdown --id <gpu-worker-id>` when it is no longer
+needed.
+
 Open http://localhost:8080 (merge view) or http://localhost:8000/docs (API reference).
 
 ### Refreshing a dataset snapshot
@@ -77,6 +108,7 @@ before importing:
 
 ```bash
 docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/001_live_refresh.sql
+docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/002_open_claim_taxonomy.sql
 ```
 
 ## Repository layout

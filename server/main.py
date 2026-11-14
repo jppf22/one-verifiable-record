@@ -5,6 +5,7 @@ Endpoints (see /docs for the interactive reference):
   GET  /api/articles?q=...                 search tracked articles
   GET  /api/articles/by-title?lang&title   resolve one edition
   POST /api/align/{qid}                    run alignment + verdict layers
+  POST /api/embed/{qid}                    GPU-embed missing current claims (and optional chunks)
   GET  /api/merge/{qid}                    git-diff-style merged view (+ summary,
                                            latest review per link, wiki permalinks)
   POST /api/recheck/{qid}                  re-check the article; body (optional)
@@ -26,6 +27,7 @@ from threading import Lock
 from time import monotonic
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +35,7 @@ from pydantic import BaseModel
 
 import alignment
 import diff
+import embedding_jobs
 import patches
 import rag
 import recheck
@@ -232,6 +235,22 @@ def align(qid: str):
     counts = alignment.align_article(qid)
     verdict_counts = verdicts.run_verdicts(qid)
     return {"qid": qid, **counts, "verdicts": verdict_counts}
+
+
+@app.post("/api/embed/{qid}")
+def embed_entity(qid: str, include_chunks: bool = False):
+    """Embed missing current claims for one entity through the Verda GPU worker.
+
+    Pass ``include_chunks=true`` after an import to also populate RAG passages.
+    This is intentionally QID-scoped: a browser cannot accidentally start a
+    corpus-wide GPU job.
+    """
+    if not query_one("SELECT 1 AS ok FROM articles WHERE wikidata_qid = %s LIMIT 1", (qid,)):
+        raise HTTPException(404, "article not tracked")
+    try:
+        return embedding_jobs.embed_qid(qid, ("claims", "chunks") if include_chunks else ("claims",))
+    except (httpx.HTTPError, RuntimeError) as exc:
+        raise HTTPException(503, f"GPU embedding worker unavailable: {exc}")
 
 
 @app.get("/api/merge/{qid}")
