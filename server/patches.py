@@ -137,7 +137,7 @@ def generate_suggestions(page_id: int):
     ids = list(pages_by_id)
     drafts = query(
         f"""SELECT s.id, s.patch_type, s.wikitext, s.status, a.lang, a.title,
-                   s.article_id AS page_id, s.claim_link_id
+                   s.article_id AS page_id, s.claim_link_id, s.resolution_id
             FROM suggestions s
             JOIN articles a ON a.id = s.article_id
             WHERE s.article_id IN ({placeholders(ids)})

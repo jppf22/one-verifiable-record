@@ -8,11 +8,12 @@ the full evolution of every verdict stays queryable in SQL.
 """
 import json
 
-import httpx
+import llm
 
 from config import settings
 from db import execute, placeholders, query, query_one
 from pages import comparison_set
+from predicates import same as same_predicate, same_subject
 
 NUMERIC_TOLERANCE = 1e-9
 VALID_VERDICTS = {
@@ -40,8 +41,8 @@ def _same_fact(a: dict, b: dict) -> bool:
     pa, pb = a.get("predicate_entity"), b.get("predicate_entity")
     if pa and pb:
         return pa == pb
-    pa, pb = (a.get("predicate") or "").lower(), (b.get("predicate") or "").lower()
-    return bool(pa) and pa == pb
+    # aliases name the same relation (predicates.py: date_of_birth = birth_date)
+    return same_predicate(a.get("predicate"), b.get("predicate"))
 
 
 def _json(value):
@@ -82,6 +83,9 @@ def deterministic_verdict(a: dict, b: dict) -> str | None:
     """Return a verdict, or None if this pair needs the LLM layer."""
     if a["kind"] != b["kind"] or not _same_fact(a, b):
         return None
+    # same relation but maybe a different thing (predicates.same_subject): let the LLM decide
+    if not same_subject(a.get("predicate"), a.get("subject"), b.get("subject")):
+        return None
     va, vb = a["value_normalized"], b["value_normalized"]
     if not va or not vb:
         return None
@@ -116,7 +120,7 @@ def llm_verdict(a: dict, b: dict):
     if not settings.verda_api_key:
         # Keep a loose vector candidate visible instead of misrepresenting it
         # as a confirmed gap when semantic verification is unavailable.
-        return "possible_match", "unknown", None, "no LLM configured (set VERDA_API_KEY)", False
+        return None, "unknown", None, "no LLM configured (set VERDA_API_KEY)", False
     messages = [
         {
             "role": "system",
@@ -153,31 +157,21 @@ def llm_verdict(a: dict, b: dict):
         },
     ]
     try:
-        r = httpx.post(
-            f"{settings.verda_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.verda_api_key}"},
-            json={
-                "model": settings.llm_model,
-                "messages": messages,
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        data = json.loads(r.json()["choices"][0]["message"]["content"])
-        verdict = data.get("verdict", "unverifiable")
-        if verdict not in VALID_VERDICTS:
-            verdict = "unverifiable"
-        relation = data.get("relation", "unknown")
-        relation = relation if relation in VALID_RELATIONS else "unknown"
-        try:
-            confidence = max(0.0, min(1.0, float(data.get("confidence"))))
-        except (TypeError, ValueError):
-            confidence = None
-        return verdict, relation, confidence, data.get("rationale", ""), True
-    except Exception as exc:  # degrade gracefully, never crash the pipeline
-        return "possible_match", "unknown", None, f"LLM error: {exc}", False
+        # server/llm.py paces calls under the account's 40 requests/minute and
+        # retries 429s; it raises LLMUnavailable instead of returning an error text.
+        data = llm.chat_json(messages[0]["content"], messages[1]["content"], max_tokens=300)
+    except llm.LLMUnavailable as exc:
+        return None, "unknown", None, str(exc), False
+    verdict = data.get("verdict", "unverifiable")
+    if verdict not in VALID_VERDICTS:
+        verdict = "unverifiable"
+    relation = data.get("relation", "unknown")
+    relation = relation if relation in VALID_RELATIONS else "unknown"
+    try:
+        confidence = max(0.0, min(1.0, float(data.get("confidence"))))
+    except (TypeError, ValueError):
+        confidence = None
+    return verdict, relation, confidence, data.get("rationale", ""), True
 
 
 PAIR_SELECT = """
@@ -233,14 +227,14 @@ def fetch_pairs_by_ids(link_ids) -> list:
 
 def _predicate_match_score(a: dict, b: dict) -> float:
     """How strongly the two claims' predicates agree: 1.0 for a shared Wikidata
-    property, 0.8 for an identical predicate string, 0.3 when neither side has a
+    property, 0.8 for the same predicate or an alias of it, 0.3 when neither side has a
     predicate (unknown), 0.0 for a mismatch."""
     pea, peb = a.get("predicate_entity"), b.get("predicate_entity")
     if pea and peb:
         return 1.0 if pea == peb else 0.0
     pa, pb = (a.get("predicate") or "").lower(), (b.get("predicate") or "").lower()
     if pa and pb:
-        return 0.8 if pa == pb else 0.0
+        return 0.8 if same_predicate(pa, pb) else 0.0
     return 0.3  # at least one side has no predicate: weak, not disqualifying
 
 
@@ -285,9 +279,10 @@ def grade_pair(a: dict, b: dict):
         return det, SOURCE_DETERMINISTIC, "canonical value comparison", "same", 1.0
     verdict, relation, confidence, rationale, available = llm_verdict(a, b)
     if not available:
-        # LLM layer could not run: keep the loose candidate but label it so a
-        # guess is never mistaken for a model verdict (task 1).
-        return verdict, SOURCE_FALLBACK, rationale, relation, confidence
+        # LLM layer could not run (no key, rate limit not cleared in time): no
+        # verdict. The caller leaves the link as it is and retries later, so an
+        # error message is never stored as a verdict.
+        return None
     return verdict, SOURCE_LLM, rationale, relation, confidence
 
 
@@ -298,21 +293,29 @@ def grade_links(pairs, touch_ids=()) -> list:
     bumped even when the verdict holds. That records "re-verified against the new
     claim version" in the link's history and stops them looking stale forever.
 
-    A link whose ``verdict_source`` is already ``human`` is never overwritten by
-    a machine regrade (Q1): the reviewer's decision stands until a human changes
-    it. Returns [{id, before, after, changed}].
+    A link whose ``verdict_source`` is already ``human`` (an R1 consensus, see
+    consensus.py) is not overwritten by a machine regrade, unless it is in
+    ``touch_ids``: one of its claims has a newer version, so the decision was made
+    on text that no longer exists and the vote reopens. Returns
+    [{id, before, after, changed}].
     """
     results = []
     for p in pairs:
-        if p.get("verdict_source") == SOURCE_HUMAN:
-            # Honour the human override; report it as unchanged.
+        if p.get("verdict_source") == SOURCE_HUMAN and p["link_id"] not in touch_ids:
+            # Honour the human decision; report it as unchanged.
             results.append(
                 {"id": p["link_id"], "before": p["verdict"],
                  "after": p["verdict"], "changed": False}
             )
             continue
         a, b = _side(p, "a"), _side(p, "b")
-        verdict, source, rationale, relation, confidence = grade_pair(a, b)
+        graded = grade_pair(a, b)
+        if graded is None:
+            # deferred: 'unmatched' links stay hidden; graded links keep their verdict
+            results.append({"id": p["link_id"], "before": p["verdict"], "after": p["verdict"],
+                            "changed": False, "deferred": True})
+            continue
+        verdict, source, rationale, relation, confidence = graded
         vconf = compute_confidence(a, b, source, p.get("similarity"), confidence)
         changed = (verdict, relation, confidence) != (
             p["verdict"], p.get("relation"), p.get("candidate_confidence"))
@@ -349,16 +352,21 @@ def page_links_where(page_id: int, extra: str = ""):
 
 
 def grade_unmatched(page_id: int) -> list:
-    """Grade every 'unmatched' link between this page and its counterparts.
-    Returns grade_links() results."""
-    return grade_links(fetch_pairs(*page_links_where(page_id, "cl.verdict = 'unmatched'")))
+    """Gate, then grade, every 'unmatched' link between this page and its
+    counterparts (gate.py: one batched same-fact LLM call per counterpart instead of
+    one call per candidate). Returns grade_links()-style results for links that got
+    a verdict; rejected candidates become 'different_fact' and are not listed."""
+    import gate  # local import: gate.py imports this module
+    g = gate.gate_page(page_id)
+    return g["graded"] + grade_links(fetch_pairs_by_ids(g["to_grade"]))
 
 
 def run_verdicts(page_id: int) -> dict:
     """Grade every 'unmatched' link of this page and return verdict counts."""
     counts: dict = {}
     for r in grade_unmatched(page_id):
-        counts[r["after"]] = counts.get(r["after"], 0) + 1
+        if not r.get("deferred"):
+            counts[r["after"]] = counts.get(r["after"], 0) + 1
     return counts
 
 
@@ -375,8 +383,9 @@ HUMAN_DECISION_VERDICT = {
         "contradicted": "supported",
         "possible_conflict": "supported",
     },
-    # a "fix" marks the pair a false positive (same name, different concept)
-    "fix": "definition_mismatch",
+    # a "fix" says the conflict is real and the page text needs to change
+    # (owner decision 2026-11-14, docs/review-consensus.md O2)
+    "fix": "contradicted",
 }
 
 

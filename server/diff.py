@@ -6,7 +6,9 @@ page X (X plus its counterpart pages). Only links that say "same fact"
 (possible_match / possible_conflict) connect claims. This keeps discovery
 candidates visible without presenting them as confirmed truth. Unmatched,
 unverifiable and definition_mismatch links remain attached to their local row
-as receipts but do not connect claims.
+as receipts but do not connect claims. Neither do guesses made while the LLM was
+unavailable (verdict_source 'deterministic-fallback'): otherwise one failed
+grading run glues every claim of a page into a single row.
 
 Row status, relative to this page:
   conflict      the row has a claim here and a contradicted link (normally
@@ -18,6 +20,7 @@ Row status, relative to this page:
   only_here     this page states it, no counterpart claim in the row
   agree         claims here and there, all connecting links supported
 """
+import consensus
 from db import query
 from pages import counterparts, get_page, in_list, revision_url
 
@@ -26,6 +29,19 @@ STATUS_ORDER = {s: i for i, s in enumerate(STATUSES)}
 STRONG_CONNECTING = {"supported", "contradicted"}
 WEAK_CONNECTING = {"possible_match", "possible_conflict"}
 CONNECTING = STRONG_CONNECTING | WEAK_CONNECTING
+SOURCE_FALLBACK = "deterministic-fallback"
+
+
+def connects(link) -> bool:
+    """Does this link put its two claims in the same row?"""
+    if link["verdict"] in STRONG_CONNECTING:
+        return True
+    if link.get("verdict_source") == SOURCE_FALLBACK:
+        return False
+    if link["verdict"] in WEAK_CONNECTING:
+        return True
+    # the same-fact gate (gate.py) confirmed it is the same fact; values unclear
+    return link["verdict"] == "unverifiable" and link.get("relation") == "same"
 
 # kept for callers that build revision permalinks
 wiki_url = revision_url
@@ -87,40 +103,92 @@ def _row_label(claims, field):
     return max(counts, key=lambda v: (counts[v], -len(v))) if counts else None
 
 
-def build_rows(page_id: int, claims, links) -> list:
-    """Pure clustering + classification relative to page_id (no DB access)."""
+HIDDEN_VERDICTS = {"different_fact"}  # gate rejections (gate.py): never shown
+
+
+def _strength(link):
+    """Which link wins when a claim could join several rows: confirmed same-fact
+    verdicts first, then same-property (deterministic) comparisons, then the
+    closer vector match."""
+    return (link["verdict"] in STRONG_CONNECTING,
+            link.get("verdict_source") in ("deterministic", "human"),
+            link.get("similarity") or 0.0)
+
+
+def build_rows(page_id: int, claims, links, stats: dict | None = None) -> list:
+    """Pure classification relative to page_id (no DB access): one row per fact.
+
+    Rows are anchored on this page's claims instead of being transitive connected
+    components. Each counterpart claim joins the row of at most one claim here (its
+    strongest connecting link), and a row holds at most one claim per counterpart
+    language. Before this, one weak link chain (A~B, B~C, C~D...) merged every claim
+    of a page into a single "conflict" row with hundreds of verdicts. Counterpart
+    claims with no partner here form "missing here" rows, grouped only with their
+    direct partners. Links that don't connect (unmatched, unverifiable, guesses made
+    without the LLM) are listed only when someone reviewed them, so receipts and votes
+    stay visible; the rest are counted in ``stats["hidden"]``. Gate rejections
+    ('different_fact') are never listed.
+    """
     by_id = {c["id"]: c for c in claims}
-    parent = {cid: cid for cid in by_id}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    links = [l for l in links if l["claim_a"] in by_id and l["claim_b"] in by_id]
-    for link in links:
-        if link["verdict"] in CONNECTING:
-            ra, rb = find(link["claim_a"]), find(link["claim_b"])
-            if ra != rb:
-                parent[ra] = rb
-
-    members_by_root: dict = {}
-    for cid in by_id:
-        members_by_root.setdefault(find(cid), []).append(cid)
+    links = [l for l in links if l["claim_a"] in by_id and l["claim_b"] in by_id
+             and l["verdict"] not in HIDDEN_VERDICTS]
 
     def is_here(cid):
         return by_id[cid]["page_id"] == page_id
 
+    conn = [l for l in links if connects(l)]
+    adjacency: dict = {}
+    for l in conn:
+        adjacency.setdefault(l["claim_a"], []).append((l["claim_b"], l))
+        adjacency.setdefault(l["claim_b"], []).append((l["claim_a"], l))
+
+    # 1. every counterpart claim -> its strongest partner here; one claim per language per row
+    best: dict = {}  # (here id, lang) -> (strength, counterpart id)
+    for l in conn:
+        a, b = l["claim_a"], l["claim_b"]
+        if is_here(a) == is_here(b):
+            continue
+        h, o = (a, b) if is_here(a) else (b, a)
+        key, cand = (h, by_id[o]["lang"]), (_strength(l), o)
+        if key not in best or cand[0] > best[key][0]:
+            best[key] = cand
+    row_of = {cid: cid for cid in by_id if is_here(cid)}
+    claimed: dict = {}  # counterpart id -> (strength, here id): a claim joins one row only
+    for (h, _lang), (strength, o) in best.items():
+        if o not in claimed or strength > claimed[o][0]:
+            claimed[o] = (strength, h)
+    for o, (_strength_value, h) in claimed.items():
+        row_of[o] = h
+
+    # 2. counterpart claims with no partner here: a row with their direct partners only
+    for cid in sorted(by_id):
+        if cid in row_of:
+            continue
+        row_of[cid] = cid
+        langs = {by_id[cid]["lang"]}
+        for other, _l in sorted(adjacency.get(cid, []), key=lambda x: _strength(x[1]), reverse=True):
+            if other not in row_of and not is_here(other) and by_id[other]["lang"] not in langs:
+                row_of[other] = cid
+                langs.add(by_id[other]["lang"])
+
+    members_by_root: dict = {}
+    for cid in by_id:
+        members_by_root.setdefault(row_of[cid], []).append(cid)
+
     links_by_root: dict = {}
+    hidden = 0
     for link in links:
-        if link["verdict"] in CONNECTING:
-            root = find(link["claim_a"])
+        a, b = link["claim_a"], link["claim_b"]
+        if connects(link) and row_of[a] == row_of[b]:
+            links_by_root.setdefault(row_of[a], []).append(link)
+        elif link.get("review") or link["verdict"] == "unmatched":
+            # keep reviewed receipts (and ungraded candidates, which the web hides)
+            anchor = a if is_here(a) else b
+            links_by_root.setdefault(row_of[anchor], []).append(link)
         else:
-            # non-connecting link: show it on the row of its claim on this page
-            anchor = link["claim_a"] if is_here(link["claim_a"]) else link["claim_b"]
-            root = find(anchor)
-        links_by_root.setdefault(root, []).append(link)
+            hidden += 1
+    if stats is not None:
+        stats["hidden"] = hidden
 
     rows = []
     for root, members in members_by_root.items():
@@ -131,7 +199,7 @@ def build_rows(page_id: int, claims, links) -> list:
         for m in members:
             if not is_here(m):
                 there.setdefault(by_id[m]["lang"], []).append(by_id[m])
-        connecting = [l for l in row_links if l["verdict"] in CONNECTING]
+        connecting = [l for l in row_links if connects(l)]
         if not here:
             status = "missing_here"  # even if counterparts disagree among themselves
         elif any(l["verdict"] == "contradicted" for l in connecting):
@@ -140,8 +208,8 @@ def build_rows(page_id: int, claims, links) -> list:
             status = "possible_conflict"
         elif not there:
             status = "only_here"
-        elif any(l["verdict"] == "possible_match" for l in connecting):
-            status = "possible_match"
+        elif any(l["verdict"] in ("possible_match", "unverifiable") for l in connecting):
+            status = "possible_match"  # same fact, values not confirmed equal
         else:
             status = "agree"
         all_claims = [by_id[m] for m in members]
@@ -194,11 +262,26 @@ def build_comparison(page_id: int, with_reviews: bool = True, page=None, cps=Non
         c["url"] = revision_url(c["lang"], c["revision_id"])
     links = _fetch_links(ids)
     reviews = _fetch_latest_reviews([l["id"] for l in links]) if with_reviews and links else {}
+    # R1 tally (consensus.py), only for links that have a review
+    tallies = consensus.tallies(list(reviews)) if reviews else {}
+    # resolutions (resolutions.py): only reviewer-confirmed conflicts can have one
+    confirmed = [l["id"] for l in links
+                 if l["verdict"] == "contradicted" and l["verdict_source"] == "human"]
+    fixes = {}
+    if with_reviews and confirmed:
+        import resolutions  # local import: resolutions.py imports this module
+        fixes = resolutions.latest_many(confirmed)
     for link in links:
         link["review"] = reviews.get(link["id"])
+        if link["id"] in tallies:
+            link["consensus"] = tallies[link["id"]]
+        if link["id"] in fixes:
+            link["resolution"] = fixes[link["id"]]
 
-    rows = build_rows(page_id, claims, links)
-    return {"page": page, "counterparts": cps, "summary": summarize(rows), "rows": rows}
+    stats: dict = {}
+    rows = build_rows(page_id, claims, links, stats)
+    summary = {**summarize(rows), "links_hidden": stats.get("hidden", 0)}
+    return {"page": page, "counterparts": cps, "summary": summary, "rows": rows}
 
 
 def page_summary(page_id: int) -> dict:

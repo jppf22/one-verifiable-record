@@ -112,21 +112,27 @@ def in_list(ids) -> tuple:
 
 
 # Claim-link endpoints seen from each side, restricted to links whose two claims
-# sit on counterpart pages (page_links). `page` = the side being counted, `here`
-# = that side's claim. Only supported/contradicted links connect claims (same
-# rule as diff.py): unmatched, unverifiable and definition_mismatch do not.
-_ENDPOINTS = """
+# sit on counterpart pages (page_links). Mirrors diff.connects() so SQL candidate
+# ranking agrees with the comparison view.
+_CONNECT_WHERE = """(
+    cl.verdict IN ('supported', 'contradicted')
+    OR (cl.verdict_source <> 'deterministic-fallback'
+        AND (cl.verdict IN ('possible_match', 'possible_conflict')
+             OR (cl.verdict = 'unverifiable' AND cl.relation = 'same')))
+)"""
+
+_ENDPOINTS = f"""
 SELECT ca.article_id AS page, cb.article_id AS other, cl.claim_a AS here, cl.verdict
 FROM claim_links cl
 JOIN claims ca ON ca.id = cl.claim_a
 JOIN claims cb ON cb.id = cl.claim_b
-WHERE cl.verdict IN ('supported', 'contradicted'){fa}
+WHERE {_CONNECT_WHERE}{{fa}}
 UNION ALL
 SELECT cb.article_id, ca.article_id, cl.claim_b, cl.verdict
 FROM claim_links cl
 JOIN claims ca ON ca.id = cl.claim_a
 JOIN claims cb ON cb.id = cl.claim_b
-WHERE cl.verdict IN ('supported', 'contradicted'){fb}
+WHERE {_CONNECT_WHERE}{{fb}}
 """
 
 
@@ -145,8 +151,7 @@ GROUP BY e.page, e.here
 
 
 def ranked_pages(limit: int) -> list:
-    """Pages with >=1 counterpart, most conflicted first: one aggregation query.
-    conflicts = claims on the page with a contradicted link to a counterpart."""
+    """Pages with >=1 counterpart, most conflicted and richly linked first."""
     rows = query(
         f"""SELECT {PAGE_COLS},
                    COALESCE(s.conflicts, 0) AS conflicts,
@@ -164,73 +169,228 @@ def ranked_pages(limit: int) -> list:
     return rows
 
 
-def page_stats(page_ids) -> dict:
-    """Approximate per-page status counts via SQL aggregation (claim level, not
-    the connected-component rows of the comparison view):
-      conflict     claims here with a contradicted link to a counterpart
-      agree        claims here with a supported link and no contradicted one
-      only_here    claims here with no graded link to any counterpart
-      missing_here counterpart claims with no graded link to a claim here
+def page_stats(page_ids, cps: dict | None = None) -> dict:
+    """Exact per-page comparison row counts, computed with two bulk SQL queries
+    and diff.build_rows() so the landing list, search results, badge and
+    comparison view always report identical numbers."""
+    from diff import _fetch_claims, _fetch_links, build_rows, status_counts
+
+    page_ids = list(page_ids)
+    out = {
+        pid: {
+            "conflicts": 0,
+            "possible_conflicts": 0,
+            "missing_here": 0,
+            "only_here": 0,
+            "possible_matches": 0,
+            "agree": 0,
+        }
+        for pid in page_ids
+    }
+    if not page_ids:
+        return out
+
+    cps = counterparts_many(page_ids) if cps is None else cps
+    all_ids = sorted({pid for pid in page_ids} | {p["id"] for pid in page_ids for p in cps.get(pid, ())})
+    if not all_ids:
+        return out
+
+    all_claims = _fetch_claims(all_ids)
+    all_links = _fetch_links(all_ids)
+
+    claims_by_page: dict[int, list] = {}
+    claim_page: dict[int, int] = {}
+    for c in all_claims:
+        claims_by_page.setdefault(c["page_id"], []).append(c)
+        claim_page[c["id"]] = c["page_id"]
+
+    links_by_page: dict[int, list] = {}
+    for l in all_links:
+        pa = claim_page.get(l["claim_a"])
+        pb = claim_page.get(l["claim_b"])
+        if pa is not None and pb is not None:
+            links_by_page.setdefault(pa, []).append((pb, l))
+
+    for pid in page_ids:
+        cp_list = cps.get(pid, ())
+        if not cp_list:
+            continue
+        set_ids = [pid] + [p["id"] for p in cp_list]
+        set_lookup = set(set_ids)
+        set_claims = [c for sid in set_ids for c in claims_by_page.get(sid, ())]
+        set_links = [
+            l for sid in set_ids
+            for other_pid, l in links_by_page.get(sid, ())
+            if other_pid in set_lookup
+        ]
+        sc = status_counts(build_rows(pid, set_claims, set_links))
+        out[pid] = {
+            "conflicts": sc["conflict"],
+            "possible_conflicts": sc["possible_conflict"],
+            "missing_here": sc["missing_here"],
+            "only_here": sc["only_here"],
+            "possible_matches": sc["possible_match"],
+            "agree": sc["agree"],
+        }
+    return out
+
+
+def conflict_counts(page_ids, cps: dict | None = None) -> dict:
+    """{page_id: exact conflict row count} matching the comparison view."""
+    return {pid: s["conflicts"] for pid, s in page_stats(page_ids, cps=cps).items()}
+
+
+def review_queue(limit: int = 50, offset: int = 0, status: Optional[str] = None,
+                 lang: Optional[str] = None, reviewer: Optional[str] = None) -> dict:
+    """Get claim links needing review for the reviewer dashboard.
+    
+    Returns paginated list of claim links that:
+    - Have verdict != 'supported' (need attention)
+    - Either have no reviews or have reviews but not enough for consensus
+    - Can be filtered by status, language, and reviewer
+    
+    Sorts by: most conflicts first, then by newest claims, then by similarity score
     """
-    page_ids = list(page_ids)
-    out = {pid: {"conflicts": 0, "missing_here": 0, "only_here": 0, "agree": 0}
-           for pid in page_ids}
-    if not page_ids:
-        return out
-    frag, params = in_list(page_ids)
-    for r in query(
-        f"""SELECT pc.page, SUM(pc.has_c) AS conflicts,
-                   SUM(pc.has_s AND NOT pc.has_c) AS agree,
-                   COUNT(*) AS linked
-            FROM ({_per_claim_sql(frag)}) pc
-            GROUP BY pc.page""",
-        params + params,
-    ):
-        o = out[r["page"]]
-        o["conflicts"] = int(r["conflicts"] or 0)
-        o["agree"] = int(r["agree"] or 0)
-        o["_linked"] = int(r["linked"] or 0)
-    for r in query(
-        f"""SELECT article_id AS page, COUNT(*) AS n FROM claims
-            WHERE article_id IN {frag} GROUP BY article_id""",
-        params,
-    ):
-        o = out[r["page"]]
-        o["only_here"] = max(0, int(r["n"]) - o.get("_linked", 0))
-    # counterpart claims with no graded link to any claim on page X
-    for r in query(
-        f"""SELECT pl.page_a AS page, COUNT(*) AS n
-            FROM page_links pl
-            JOIN claims c ON c.article_id = pl.page_b
-            WHERE pl.page_a IN {frag} AND pl.page_b <> pl.page_a
-              AND NOT EXISTS (
-                SELECT 1 FROM claim_links cl JOIN claims h ON h.id = cl.claim_b
-                WHERE cl.claim_a = c.id AND cl.verdict IN ('supported', 'contradicted')
-                  AND h.article_id = pl.page_a)
-              AND NOT EXISTS (
-                SELECT 1 FROM claim_links cl JOIN claims h ON h.id = cl.claim_a
-                WHERE cl.claim_b = c.id AND cl.verdict IN ('supported', 'contradicted')
-                  AND h.article_id = pl.page_a)
-            GROUP BY pl.page_a""",
-        params,
-    ):
-        out[r["page"]]["missing_here"] = int(r["n"])
-    for o in out.values():
-        o.pop("_linked", None)
-    return out
-
-
-def conflict_counts(page_ids) -> dict:
-    """{page_id: conflicts} (same definition as page_stats), one query."""
-    page_ids = list(page_ids)
-    out = {pid: 0 for pid in page_ids}
-    if not page_ids:
-        return out
-    frag, params = in_list(page_ids)
-    for r in query(
-        f"""SELECT pc.page, SUM(pc.has_c) AS conflicts
-            FROM ({_per_claim_sql(frag)}) pc GROUP BY pc.page""",
-        params + params,
-    ):
-        out[r["page"]] = int(r["conflicts"] or 0)
-    return out
+    from db import query, query_one
+    
+    # Build WHERE clause
+    where_parts = []
+    params = []
+    
+    # Only links that need review (not already settled by human consensus)
+    where_parts.append("cl.verdict_source != 'human' OR cl.verdict_source IS NULL")
+    
+    # Filter by verdict status if provided
+    if status and status != "all":
+        where_parts.append("cl.verdict = %s")
+        params.append(status)
+    else:
+        # Default: show conflicts and possible conflicts (things that need attention)
+        where_parts.append("cl.verdict IN ('contradicted', 'possible_conflict', 'possible_match', 'unverifiable')")
+    
+    # Join tables
+    sql = f"""
+        SELECT DISTINCT cl.id as link_id, cl.verdict, cl.similarity, cl.verdict_source,
+               cl.computed_at,
+               ca.id as claim_a_id, ca.article_id as page_a_id, ca.lang as lang_a,
+               ca.statement_text as text_a, ca.value_text as value_a,
+               ca.predicate as predicate_a, ca.revision_id as revision_a,
+               cb.id as claim_b_id, cb.article_id as page_b_id, cb.lang as lang_b,
+               cb.statement_text as text_b, cb.value_text as value_b,
+               cb.predicate as predicate_b, cb.revision_id as revision_b,
+               pa.id as page_a_article_id, pa.lang as page_a_lang, pa.title as page_a_title,
+               pb.id as page_b_article_id, pb.lang as page_b_lang, pb.title as page_b_title,
+               COUNT(DISTINCT r.id) as review_count,
+               MAX(r.decision = 'agree') as has_agree,
+               MAX(r.decision = 'disagree') as has_disagree,
+               MAX(r.decision = 'fix') as has_fix
+        FROM claim_links cl
+        JOIN claims ca ON ca.id = cl.claim_a
+        JOIN claims cb ON cb.id = cl.claim_b
+        JOIN articles pa ON pa.id = ca.article_id
+        JOIN articles pb ON pb.id = cb.article_id
+        LEFT JOIN reviews r ON r.claim_link_id = cl.id
+    """
+    
+    # Add WHERE conditions
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+    
+    # Filter by language if provided
+    if lang:
+        sql += " AND (ca.lang = %s OR cb.lang = %s)"
+        params.extend([lang, lang])
+    
+    # Filter by reviewer (show links they've already reviewed)
+    if reviewer:
+        sql += " AND EXISTS (SELECT 1 FROM reviews r2 WHERE r2.claim_link_id = cl.id AND r2.reviewer = %s)"
+        params.append(reviewer)
+    
+    # Group by link
+    sql += """
+        GROUP BY cl.id, cl.verdict, cl.similarity, cl.verdict_source, cl.computed_at,
+                 ca.id, ca.article_id, ca.lang, ca.statement_text, ca.value_text, ca.predicate, ca.revision_id,
+                 cb.id, cb.article_id, cb.lang, cb.statement_text, cb.value_text, cb.predicate, cb.revision_id,
+                 pa.id, pa.lang, pa.title, pb.id, pb.lang, pb.title
+    """
+    
+    # Order by: conflicts first, then by newest computed_at, then by lowest similarity (most uncertain)
+    sql += " ORDER BY "
+    if status == "agree" or status == "supported":
+        sql += "cl.computed_at DESC, cl.similarity ASC"
+    else:
+        sql += "(cl.verdict = 'contradicted') DESC, cl.computed_at DESC, cl.similarity ASC"
+    
+    # Pagination
+    sql += " LIMIT %s OFFSET %s"
+    params.extend([limit, offset])
+    
+    # Count total for pagination
+    count_sql = f"""
+        SELECT COUNT(DISTINCT cl.id)
+        FROM claim_links cl
+        JOIN claims ca ON ca.id = cl.claim_a
+        JOIN claims cb ON cb.id = cl.claim_b
+        JOIN articles pa ON pa.id = ca.article_id
+        JOIN articles pb ON pb.id = cb.article_id
+    """
+    if where_parts:
+        count_sql += " WHERE " + " AND ".join(where_parts)
+    if lang:
+        count_sql += " AND (ca.lang = %s OR cb.lang = %s)"
+    if reviewer:
+        count_sql += " AND EXISTS (SELECT 1 FROM reviews r2 WHERE r2.claim_link_id = cl.id AND r2.reviewer = %s)"
+    
+    total = query_one(count_sql, tuple(params[:-2]))
+    total_count = total["COUNT(DISTINCT cl.id)"] if total else 0
+    
+    rows = query(sql, params)
+    
+    items = []
+    for r in rows:
+        # Determine which page is "this page" perspective
+        # For dashboard, we'll use page_a as the primary
+        items.append({
+            "link_id": r["link_id"],
+            "verdict": r["verdict"],
+            "verdict_source": r["verdict_source"],
+            "similarity": r["similarity"],
+            "computed_at": r["computed_at"],
+            "review_count": r["review_count"],
+            "has_review": r["review_count"] > 0,
+            "claim_a": {
+                "id": r["claim_a_id"],
+                "page_id": r["page_a_id"],
+                "lang": r["lang_a"],
+                "text": r["text_a"],
+                "value": r["value_a"],
+                "predicate": r["predicate_a"],
+                "revision_id": r["revision_a"],
+            },
+            "claim_b": {
+                "id": r["claim_b_id"],
+                "page_id": r["page_b_id"],
+                "lang": r["lang_b"],
+                "text": r["text_b"],
+                "value": r["value_b"],
+                "predicate": r["predicate_b"],
+                "revision_id": r["revision_b"],
+            },
+            "page_a": {
+                "id": r["page_a_article_id"],
+                "lang": r["page_a_lang"],
+                "title": r["page_a_title"],
+            },
+            "page_b": {
+                "id": r["page_b_article_id"],
+                "lang": r["page_b_lang"],
+                "title": r["page_b_title"],
+            },
+        })
+    
+    return {
+        "items": items,
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+    }

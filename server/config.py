@@ -17,11 +17,12 @@ class Settings(BaseSettings):
     # Verda's gateway has no embeddings endpoint: we serve e5 ourselves (embedder/)
     embed_base_url: str = "http://embedder:8001/v1"
 
-    # Discovery-oriented alignment. These are intentionally generous: vector
-    # search proposes candidates, while semantic grading decides whether they
-    # are the same fact or a possible/confirmed conflict.
-    match_distance: float = 0.28
-    nearest_k: int = 12
+    # Discovery-oriented alignment. Vector search proposes tight candidates, while
+    # gate.py + semantic grading decide whether they state the same fact.
+    match_distance: float = 0.24
+    nearest_k: int = 3
+    semantic_match_distance: float = 0.14
+    semantic_nearest_k: int = 2
     counterpart_min_confidence: float = 0.90
     top_k: int = 8
     
@@ -32,6 +33,18 @@ class Settings(BaseSettings):
     strict_subject_filter: bool = False
     # Minimum similarity for candidate links (0.0-1.0, where 1.0 = identical)
     min_similarity: float = 0.70
+
+    # Verda Inference pacing (server/llm.py). The account allows 40 requests per
+    # minute shared by every process using the key; 1.6 s between call starts
+    # stays under it. Calls that cannot finish within the budget are left undone.
+    llm_min_interval_s: float = 1.6
+    llm_max_attempts: int = 4
+    llm_timeout_s: float = 90.0
+    llm_budget_s: float = 150.0
+    # Same-fact gate (server/gate.py): candidates per claim sent to the LLM, and
+    # claims per batched call (~50 output tokens and ~0.6 s per claim).
+    gate_max_candidates: int = 4
+    gate_batch_size: int = 20
     
     # Public demo protection. The web app proxies /api, so these limits cover
     # browser writes without putting a costly LLM endpoint directly on port 8000.

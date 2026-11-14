@@ -20,8 +20,13 @@ with its counterpart pages (page_links). Endpoints (see /docs):
   POST /api/suggestions/{id}/export        mark a draft exported, then re-check
   GET  /api/claims/{id}/history            biography of a claim + its links and
                                            their reviews (FOR SYSTEM_TIME ALL)
-  POST /api/reviews                        human review, then re-check claim_a's page
+  POST /api/reviews                        human review (+ R1 consensus), re-check claim_a's page
+  GET  /api/links/{id}/consensus           R1 tally of one link (SVT-pinned votes)
   GET  /api/reviews?link_id=               reviews of one link, newest first
+  POST /api/links/{id}/resolution          write the correct version (English) of a
+                                           reviewer-confirmed conflict; drafts it
+                                           for every language of the comparison set
+  GET  /api/links/{id}/resolution          latest resolution of a link + its drafts
   GET  /api/qa?page=&q=&lang=              grounded Q&A over the comparison set
   GET  /api/badge?lang&title               extension badge
   GET  /api/extension/resolve              page-id-first extension resolver
@@ -37,11 +42,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import alignment
+import consensus
 import diff
 import pages
 import patches
 import rag
 import recheck
+import resolutions
 import verdicts
 from db import insert, placeholders, query, query_one
 
@@ -95,7 +102,7 @@ def search_pages(q: str = Query(min_length=2), lang: Optional[str] = None,
     )
     ids = [r["id"] for r in rows]
     cps = pages.counterparts_many(ids)
-    conflicts = pages.conflict_counts(ids)
+    conflicts = pages.conflict_counts(ids, cps=cps)
     return [
         {"page": pages.page_obj(r), "counterparts": cps[r["id"]],
          "conflicts": conflicts[r["id"]]}
@@ -105,17 +112,26 @@ def search_pages(q: str = Query(min_length=2), lang: Optional[str] = None,
 
 @app.get("/api/pages/conflicted")
 def conflicted_pages(limit: int = Query(50, ge=1, le=200)):
-    """Landing list: pages with counterparts, most conflicted first. Computed
-    with SQL aggregation over claim_links (claim-level counts), not by building
-    comparison payloads."""
-    rows = pages.ranked_pages(limit)
+    """Landing list: pages with counterparts, most conflicted first. Uses bulk
+    comparison row construction so counts match GET /pages/{id}/compare."""
+    rows = pages.ranked_pages(min(200, max(limit, limit + 25)))
     ids = [r["id"] for r in rows]
     cps = pages.counterparts_many(ids)
-    stats = pages.page_stats(ids)
-    return [
+    stats = pages.page_stats(ids, cps=cps)
+    items = [
         {"page": pages.page_obj(r), "counterparts": cps[r["id"]], **stats[r["id"]]}
         for r in rows
     ]
+    items.sort(
+        key=lambda x: (
+            -x["conflicts"],
+            -x.get("possible_conflicts", 0),
+            -(x["agree"] + x["missing_here"] + x["only_here"]),
+            x["page"]["title"],
+            x["page"]["lang"],
+        )
+    )
+    return items[:limit]
 
 
 @app.get("/api/pages/by-title")
@@ -424,7 +440,7 @@ class Review(BaseModel):
     reviewer: str
     decision: str  # agree | disagree | fix
     note: Optional[str] = None
-    override: bool = False  # Q1: apply the decision as the machine verdict
+    override: bool = False  # Q1/Q4: let the R1 consensus decide the verdict
 
 
 @app.post("/api/reviews")
@@ -445,16 +461,47 @@ def create_review(r: Review):
         "VALUES (%s, %s, %s, %s)",
         (r.claim_link_id, r.reviewer, r.decision, r.note),
     )
-    # Q1 (assumptions.md): by default the review does not overwrite the machine
-    # verdict — we re-check the page of claim_a and report whether the conflict
-    # resurfaces (decision 4). When override=true, the decision sets the verdict
-    # (verdict_source='human'), and the re-check then runs over the new state.
-    override_result = (
-        verdicts.apply_human_verdict(r.claim_link_id, r.decision) if r.override else None
-    )
+    # Q1/Q4 (assumptions.md): a single review never sets the verdict. With
+    # override=true the R1 consensus (consensus.py) is evaluated: once enough
+    # distinct reviewers agree, the decided verdict is written with
+    # verdict_source='human'; if later votes break the consensus, the machine
+    # verdict comes back. Then the page of claim_a is re-checked as before.
+    override_result = consensus.enforce(r.claim_link_id) if r.override else None
     result = recheck.recheck_page(link["page_id"], [r.claim_link_id])
     return {"ok": True, "review_id": review_id, "override": override_result,
-            "recheck": result}
+            "consensus": consensus.tally(r.claim_link_id), "recheck": result}
+
+
+@app.get("/api/links/{link_id}/consensus")
+def link_consensus(link_id: int):
+    """R1 tally for one link: votes pinned to the verdict version they were cast on."""
+    if not query_one("SELECT id FROM claim_links WHERE id = %s", (link_id,)):
+        raise HTTPException(404, "claim link not found")
+    return consensus.tally(link_id)
+
+
+class Resolution(BaseModel):
+    author: str
+    correct_text: str  # the correct version, in English
+    source_url: Optional[str] = None  # reliable non-Wikipedia source
+
+
+@app.post("/api/links/{link_id}/resolution")
+def create_resolution(link_id: int, r: Resolution):
+    """Only for a conflict confirmed by reviewers (contradicted, source human).
+    Stores the English text and drafts it, translated, for every page of the
+    comparison set. Export-only: nothing is sent to Wikipedia."""
+    try:
+        return resolutions.create(link_id, r.author, r.correct_text, r.source_url)
+    except resolutions.ResolutionError as e:
+        raise HTTPException(e.status, e.message)
+
+
+@app.get("/api/links/{link_id}/resolution")
+def get_resolution(link_id: int):
+    if not query_one("SELECT id FROM claim_links WHERE id = %s", (link_id,)):
+        raise HTTPException(404, "claim link not found")
+    return resolutions.latest(link_id) or {"resolution": None, "drafts": []}
 
 
 @app.get("/api/reviews")
@@ -483,3 +530,24 @@ def qa(page: int, q: str = Query(min_length=2), lang: Optional[str] = None):
     """Grounded Q&A over the comparison set of `page` (a page id)."""
     _page_or_404(page)
     return rag.answer(page, q, lang)
+
+
+@app.get("/api/review/queue")
+def review_queue(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None),
+    lang: Optional[str] = Query(None),
+    reviewer: Optional[str] = Query(None),
+):
+    """Reviewer dashboard: paginated queue of claim links needing review.
+    
+    Filters:
+    - status: verdict type (contradicted, possible_conflict, possible_match, etc.)
+    - lang: filter by claim language (fi, sv, en)
+    - reviewer: show only links this reviewer has already voted on
+    
+    Returns: {items: [...], total: N, limit: N, offset: N}
+    Each item contains link details, both claims, and their pages.
+    """
+    return pages.review_queue(limit, offset, status, lang, reviewer)

@@ -1,8 +1,10 @@
 """Re-check a page against its counterpart pages after a review or a patch export.
 
-A human review never overwrites the machine verdict. Instead the pipeline runs
+A single human review never overwrites the machine verdict: verdicts change only
+through the R1 consensus (consensus.py). The pipeline runs
 again against what is currently in MariaDB and reports whether each conflict
-*resurfaces* (contradicted before and still contradicted after).
+*resurfaces* (contradicted before and still contradicted after). Reviewed links
+whose claims haven't changed are held (``regraded: false``), so votes stay valid.
 
 Cheap by design: a graded link is only regraded when one of its two claims has
 a system-versioned row newer than the link's ``computed_at``. That is detected
@@ -14,7 +16,7 @@ from datetime import datetime
 
 import alignment
 import verdicts
-from db import query, query_one
+from db import execute, placeholders, query, query_one
 from diff import page_summary
 from verdicts import page_links_where
 
@@ -53,6 +55,17 @@ def _link_verdicts(page_id: int) -> dict:
     return {r["id"]: r["verdict"] for r in query(LINK_VERDICTS_SQL.format(where=where), params)}
 
 
+def _reviewed_verdicts(link_ids) -> dict:
+    """{link_id: current verdict} for the given links that have at least one review."""
+    if not link_ids:
+        return {}
+    return {r["id"]: r["verdict"] for r in query(
+        f"""SELECT cl.id, cl.verdict FROM claim_links cl
+            WHERE cl.id IN ({placeholders(link_ids)})
+              AND EXISTS (SELECT 1 FROM reviews r WHERE r.claim_link_id = cl.id)""",
+        tuple(link_ids))}
+
+
 def _now_iso() -> str:
     row = query_one("SELECT NOW() AS t")
     t = row["t"] if row else None
@@ -70,13 +83,37 @@ def recheck_page(page_id: int, focus_link_ids=None) -> dict:
     # 1. vector alignment: new candidate links to counterpart pages ('unmatched')
     new_links = alignment.align_page(page_id)["candidate_links"]
 
-    # 2. grade every 'unmatched' link (new candidates + never graded)
+    # 1b. heal any unreviewed links previously left in fallback / LLM-error state
+    fb_where, fb_params = page_links_where(
+        page_id,
+        "cl.verdict <> 'unmatched' AND (cl.verdict_source = 'deterministic-fallback' OR cl.rationale LIKE 'LLM error:%%')"
+        " AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.claim_link_id = cl.id)",
+    )
+    fb_ids = [r["id"] for r in query(LINK_VERDICTS_SQL.format(where=fb_where), fb_params)]
+    if fb_ids:
+        execute(
+            f"""UPDATE claim_links
+                SET verdict = 'unmatched', relation = 'unknown', rationale = NULL,
+                    computed_at = CURRENT_TIMESTAMP
+                WHERE id IN ({placeholders(fb_ids)})""",
+            tuple(fb_ids),
+        )
+
+    # 2. grade every 'unmatched' link (new candidates + healed fallbacks + never graded)
     results: dict = {r["id"]: r for r in verdicts.grade_unmatched(page_id)}
 
     # 3. regrade graded links whose claims have a newer SVT row, plus focus links
     where, params = page_links_where(page_id, "cl.verdict <> 'unmatched'")
     stale = [r["id"] for r in query(STALE_LINKS_SQL.format(where=where), params)]
     to_regrade = [i for i in dict.fromkeys(stale + focus) if i not in results]
+    # R1 (consensus.py): a reviewed link whose claims haven't changed is held, not
+    # regraded. Regrading the same text adds no evidence, and a different LLM answer
+    # would make the votes just cast stale.
+    held = _reviewed_verdicts([i for i in to_regrade if i not in set(stale)])
+    for link_id, verdict in held.items():
+        results[link_id] = {"id": link_id, "before": verdict, "after": verdict,
+                            "changed": False, "regraded": False}
+    to_regrade = [i for i in to_regrade if i not in held]
     pairs = verdicts.fetch_pairs_by_ids(to_regrade)
     for r in verdicts.grade_links(pairs, touch_ids=set(stale)):
         results[r["id"]] = r
@@ -100,7 +137,7 @@ def recheck_page(page_id: int, focus_link_ids=None) -> dict:
                 "after": after,
                 "changed": before != after,
                 "resurfaced": before == "contradicted" and after == "contradicted",
-                "regraded": True,
+                "regraded": r.get("regraded", True),
             }
         )
 
