@@ -202,6 +202,8 @@ web/
 3. Read `docs/assumptions.md` for current decisions
 4. Read `docs/page-contract.md` for API details
 5. Read `docs/project-context.md` for background
+6. Read `docs/agent-coordination.md`: other agents work in this tree at the same time.
+   Add your entry there before editing, and don't edit files another open entry lists
 
 ### Making Changes
 1. **Read first**: Never edit a file you haven't read in this session

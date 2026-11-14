@@ -149,7 +149,7 @@ AND c.ROW_START > cl.computed_at + INTERVAL 1 SECOND
 ### Verdict Sources
 - `deterministic`: From deterministic layer
 - `llm`: From LLM entailment
-- `human`: From user review (not yet implemented - see Q1 in assumptions.md)
+- `human`: Written only when a review quorum is reached (policy R1, `consensus.py`, docs/review-consensus.md)
 
 ### Grading Function
 ```python

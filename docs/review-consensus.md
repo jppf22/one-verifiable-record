@@ -1,7 +1,8 @@
 # Applying fixes and making review decisions permanent
 
-Status: **proposed** (2026-11-14, Agent 2). Policy R1 is shown in the web UI but is not
-enforced by the server yet. Owner confirmation needed on the open points at the end.
+Status: **R1 adopted and enforced** (owner, 2026-11-14: O1 and O2 accepted). The server
+computes and applies it (`server/consensus.py`); the web app renders the server's tally.
+O3 and O4 are still open.
 
 ## 1. How fixes get applied to Wikipedia
 
@@ -67,7 +68,7 @@ talk-page notice with an "in the {lang} edition" comparison link, which is not a
 Single-reviewer finality only appears where the reviewer holds a granted right. Our
 reviewers are self-declared names with no authentication, so one click must not be final.
 
-### Policy R1 (shown in the UI, `web/js/consensus.js`)
+### Policy R1 (`server/consensus.py`, rendered by `web/js/consensus.js`)
 - **One vote per reviewer per link.** A reviewer's latest review replaces their earlier
   ones. Names are compared case-insensitively.
 - **What a vote means.** *Agree* says the machine verdict is right. *Disagree* says it is
@@ -75,7 +76,11 @@ reviewers are self-declared names with no authentication, so one click must not 
   `possible_conflict` verdict and opposes any other verdict.
 - **Binding thresholds.** A verdict is **confirmed** with ≥2 confirming votes and a lead of
   ≥2. It is **overturned** with ≥3 opposing votes and a lead of ≥2. Overturning a machine
-  verdict needs the higher bar.
+  verdict needs the higher bar. Confirming `possible_conflict` writes `contradicted`, and
+  confirming `possible_match` writes `supported` (assumptions C2).
+- **Button wording.** The UI words the votes per verdict: "Real conflict" / "False alarm" on
+  conflicts, "Same fact" / "They conflict" on matches, "Not comparable" / "Real conflict"
+  (fix) on unverifiable and definition_mismatch (assumptions C1).
 - **Disputed state.** When both sides have votes and neither reaches a threshold, the link
   is **disputed**.
 - **Votes are pinned to the verdict version.** A vote counts only while the verdict that was
@@ -86,24 +91,39 @@ reviewers are self-declared names with no authentication, so one click must not 
 - **UI.** The UI shows progress such as "1 of 2 confirmations", "1 of 3 votes to overturn",
   "Disputed…", and the list of votes with stale ones struck through.
 
-### Server enforcement (proposed, for the backend owner)
-1. Add `reviews.verdict_at_review`, `rev_a` and `rev_b`, or derive them with `FOR SYSTEM_TIME AS OF`.
-2. Compute R1 on the server (for example `GET /api/links/{id}/consensus`) and include it in `/compare`.
-3. Write `verdict_source='human'` only when R1 reaches *confirmed* or *overturned*. The new
-   `override=true` single-click path in `POST /api/reviews` (backend plan task 4) should be
-   gated by this check.
-4. On re-import, keep the decision if both claims' `value_normalized` is unchanged.
-   Otherwise reopen it.
-5. Only links that reached *confirmed* through Fix votes should unlock "ready to apply"
-   patches. Exclude disputed links.
+### Server enforcement (implemented)
+1. **No schema change.** A vote's subject is derived with SVT: the latest machine version
+   of the link (`claim_links FOR SYSTEM_TIME ALL`, source not `human`) that started before
+   the review's `ROW_START`. A vote is stale if that verdict differs from the current machine
+   verdict (`verdict_changed`), if either claim's current row started after the vote
+   (`claim_changed`), or if the same reviewer voted again later (`superseded`).
+2. **API.** `GET /api/links/{id}/consensus` returns the tally. `/compare` adds
+   `links[].consensus` for reviewed links (3 queries per page, whatever the link count).
+   `POST /api/reviews` returns `consensus`.
+3. **`override: true` is gated by R1.** The web app sends it on every review.
+   - *Confirmed* writes the machine verdict again with `verdict_source='human'`.
+   - *Overturned* writes the flipped verdict: supported/possible_match → contradicted,
+     contradicted/possible_conflict → supported. For unverifiable/definition_mismatch it
+     writes contradicted only if every opposing vote is Fix; otherwise nothing is written,
+     and the UI says the reviewers didn't say what the verdict should be.
+   - A human-decided link that loses its quorum (for example a new Disagree makes it
+     disputed) gets its latest machine version restored.
+   - Only real changes are written, so each SVT row is a meaningful step.
+4. **Re-check.** Human-decided links are not regraded unless one of their claims changed.
+   A claim change regrades the link and reopens the vote. Reviewed machine links whose
+   claims haven't changed are held (`regraded: false`) instead of re-asking the LLM, so a
+   different LLM answer can't make fresh votes stale.
+5. **Built: fix it in every language.** A reviewer-confirmed conflict (`contradicted`,
+   source `human`) unlocks a form: write the correct version once in English, with a source.
+   `POST /api/links/{id}/resolution` drafts it for every language of the comparison set
+   (assumptions C6). **Not built:** disputed links are still not excluded from the older
+   automatic patch drafts.
 
 ## Open points for the owner
-- O1. Are thresholds of 2 to confirm and 3 to overturn acceptable for the demo? For a live
-  demo, pre-seed one team vote on a couple of links so a judge's click completes a quorum,
-  and label it honestly.
-- O2. Backend plan task 4 maps `fix` to `definition_mismatch` (false positive). The UI uses
-  Fix to mean "the conflict is real, the page needs editing". These meanings conflict. R1
-  treats Fix as confirming a conflict. The override mapping should follow that meaning.
+- O1. **Accepted:** 2 to confirm, 3 to overturn. Demo votes are seeded by
+  `jobs/seed_demo_votes.py` (see assumptions M8).
+- O2. **Accepted:** Fix means "the conflict is real, the page needs editing".
+  `HUMAN_DECISION_VERDICT["fix"]` is now `contradicted` (was `definition_mismatch`).
 - O3. Should the circular-citation problem in `patches.py` be fixed now? This is a
   server-owner change.
 - O4. A "trusted reviewer" role needs identity (Wikimedia OAuth, identify-only). It is out

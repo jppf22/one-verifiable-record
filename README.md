@@ -96,6 +96,16 @@ before importing:
 docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/001_live_refresh.sql
 ```
 
+Databases created before the "fix it in every language" feature also need migration 004
+(adds `resolutions` and `suggestions.resolution_id`, relabels LLM-error verdicts). It is
+idempotent. It alters system-versioned tables, so run it as root:
+
+```bash
+docker compose exec -T mariadb sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' < db/migrations/004_resolutions.sql
+docker compose exec -T mariadb sh -lc 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' < db/migrations/006_quality_columns.sql
+```
+Migration 006 adds the pipeline quality columns; without it every claim extraction and embedding fails.
+
 ## Repository layout
 
 ```

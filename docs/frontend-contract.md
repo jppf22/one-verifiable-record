@@ -138,3 +138,7 @@ Panels expose `init()` in each module. `main.js` imports and calls them.
 - (server/web) Article search now groups editions server-side and adds `/api/discover` for
   conflict-ranked and non-biographical discovery cards. The nested `editions` field is additive;
   the web client accepts both this response and the prior flat response.
+- (server/web, Kiro) Additive: `POST/GET /api/links/{id}/resolution` (fix a reviewer-confirmed
+  conflict in every language), `links[].resolution` in `/compare`, `drafts[].resolution_id` in
+  `/suggestions`. Bus event `suggestions:added {pageId, drafts}`. See page-contract.md and
+  assumptions C1–C7. Parallel work: see `docs/agent-coordination.md`.

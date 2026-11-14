@@ -94,6 +94,28 @@ Assumed (coordinator):
   button that cycles focus through conflict/possible_conflict markers (mirrors the
   web app's `g j`), and per-type filter chips (one per claim `kind` present) that
   toggle which kinds the overlay paints. An empty selection shows all kinds.
+- X6. (extension) Live MediaWiki identity & snapshot detection (`candidate()` in
+  `extension/content.js`): desktop Wikipedia skins embed `wgNamespaceNumber`,
+  `wgAction`, `wgArticleId`, `wgRevisionId`, `wgCurRevisionId` and canonical
+  `wgTitle` in inline `RLCONF` JSON (plus `#t-permalink`) rather than Parsoid
+  `<meta property="mw:pageId">` tags. Parsing `RLCONF` safely from DOM script text
+  in the MV3 isolated world enables exact snapshot matching on normal `/wiki/Title`
+  visits as well as `/w/index.php?oldid=…` permalinks, while rejecting non-article
+  namespaces (`wgNamespaceNumber !== 0`) and non-view screens (`diff`, `action!=view`).
+- X7. (extension) Prose-only text indexing (`OMIT` in `extension/content.js`) skips
+  `.infobox`, `.sidebar`, `.shortdescription`, `.hatnote`, `.toc`, thumbnails and
+  reference blocks so sidebar duplicates don't turn unique lead claims into false
+  ambiguities; `claim.context` disambiguates repeated values when a unique context
+  window exists. Ambiguous (`>=2` prose matches), unanchored, and `missing_here`
+  findings remain keyboard-reachable in the Findings tray with full receipts
+  popovers and deep links (`?focus=r-…`, `&review=1`, `&panel=suggestions`).
+- X8. (extension) Configuration sync & stale-page guidance: `popup.html` exposes
+  both the `inlineFindings` toggle and `selectedKinds` per-type filter chips synced
+  two-way via `chrome.storage.sync` with the in-page badge bar (which renders type
+  chips whenever `>=1` claim kind is present). On `stale` live pages, the badge
+  reports precomputed snapshot counts without painting live text and links directly
+  to the analysed Wikipedia `oldid` revision. `background.js` also sets tab-scoped
+  `chrome.action` badges and falls back to `/api/badge` on `404` (`X1`).
 
 ## Assumed (server)
 - S1. Stale-link detection compares `claims FOR SYSTEM_TIME ALL` `ROW_START` against
@@ -174,12 +196,59 @@ See `docs/review-consensus.md` for the research and sources.
   (wraps, visible rows only), `o` toggles the focused row's receipts.
 - M4. Receipts show `verdict_confidence` when present (additive field from the backend).
   `deterministic-fallback` is labelled "rules (LLM unavailable)".
-- M5. **Policy R1 (display only):** one vote per reviewer, 2 confirm / 3 overturn with a
-  lead of 2, otherwise disputed. A vote counts only while the verdict it was cast on is
-  current (SVT history). It is shown on reviewed links, and the server does not enforce it.
-  The UI still never sends `override=true` (decision #4 stands).
+- M5. **Policy R1 (owner-accepted, enforced in `server/consensus.py`):** one vote per
+  reviewer, 2 confirm / 3 overturn with a lead of 2, otherwise disputed. A vote counts only
+  while the machine verdict it was cast on is current and neither claim changed (SVT).
+  The web sends `override: true` on every review. A single review still never changes a
+  verdict; a quorum writes `verdict_source='human'`, and losing the quorum restores the
+  machine verdict. This replaces user decision #4 for links that reach a quorum.
+- M8. **Demo seed votes** (owner-approved): `jobs/seed_demo_votes.py` posts one Agree,
+  as reviewer "OVR team (demo seed)" with a note saying so, on three clear-cut conflicts:
+  Daniel Tilas en↔sv death date (17 vs 27 Oct 1772), Bertel Gripenberg fi↔sv death date
+  (5 vs 6 May 1947), Algar von Heiroth en↔fi death year (1988 vs 1985). Each sits at
+  "1 of 2 confirmations", so one judge click confirms it live. Links are found by page and
+  predicate through the API (not by id), dry run by default, idempotent. Run it once on each
+  deployment: `python jobs/seed_demo_votes.py --apply --api http://<host>:8080/api`.
+  Seeded on the local stack 2026-11-14 (links 11076, 268, 130).
+- M7. Re-check holds reviewed links whose claims haven't changed (`regraded: false`) and
+  regrades human-decided links only after a claim change (reopening the vote).
 - M6. Patch edit links: article edits prefill `summary=`. en talk notices prefill heading
   and body through `Template:Preload_wikitext`. fi/sv prefill only the heading.
+
+## Assumed (same-fact gate and LLM pacing, sess_383469e3, 2026-11-14)
+Why the Daniel Tilas page showed one 45-claim "conflict" row with 629 verdicts:
+alignment was widened to 12 candidates per claim at similarity >= 0.72; every candidate
+got its own LLM call (~400 per page) with no pacing; Verda allows 40 requests/minute per
+account, so most calls returned HTTP 429 and the error text was stored as a verdict
+(838 links); and rows were transitive connected components, so those links chained
+every claim into one row.
+- G1. `server/llm.py`: one throttled Verda client (>= 1.6 s between call starts, reads
+  `retry-after` / `x-ratelimit-*`, retries 429 and 5xx, reasoning mode off). On failure
+  it raises; nothing is written. A link that could not be graded stays `unmatched`
+  (hidden) and is retried on the next re-check. An error is never a verdict.
+- G2. `server/gate.py`, run inside `verdicts.grade_unmatched` (align and re-check):
+  same-property candidates (predicates.py aliases) with matching subjects skip the LLM;
+  the rest go to ONE batched call per counterpart page (<= 20 claims, <= 4 candidates
+  each) that picks the single same-fact candidate per claim and grades it. Matching is
+  1:1 per language pair. On a 45-claim page: 2 LLM calls instead of ~400.
+- G3. Rejected candidates get the new verdict `different_fact` (migration 005, additive
+  enum). They are kept, so alignment's INSERT IGNORE does not propose them again, and
+  are never shown. `summary.links_hidden` counts them (UI: "N candidate pairs ruled out").
+- G4. `diff.build_rows`: one fact per row. Rows are anchored on this page's claims;
+  a counterpart claim joins at most one row, at most one claim per language per row.
+  Strongest link wins (confirmed verdict, then same-property, then similarity). Non-
+  connecting links are listed only if reviewed. `unverifiable` connects only with
+  relation `same` (gate-confirmed same fact) and makes the row `possible_match`.
+- G5. Web default view: when the URL names no status and the page has conflicts, only
+  conflict / possible-conflict rows are shown, with a "Show all N rows" link
+  (`?status=all`). Pages without conflicts open on everything.
+- G6. Data repair `server/regate.py --title ... --apply` (dry run by default): resets
+  unreviewed LLM/fallback verdicts, reviewed placeholder verdicts ("LLM error",
+  fallback), and same-property links with different subjects, then gates again. Applied
+  to Daniel Tilas only: 625 links reset, 605 became `different_fact`, 0 error verdicts
+  remain there; joao's agree on an error placeholder is now shown as a stale vote (R1).
+  Sipilä cabinet is left for its planned re-extraction (agent-coordination.md).
+  The remaining 318 "LLM error" links in the DB are all on the Sipilä pages.
 
 ## Open questions for the owner
 - Q1. Should a human Disagree/Fix eventually **override** the machine verdict
@@ -196,7 +265,8 @@ See `docs/review-consensus.md` for the research and sources.
   A1): should new revisions **update claims in place**, so SVT keeps the old version
   and the re-check sees them as stale, or be stored as **new articles/claims rows**?
   Updating in place fits the SVT story best.
-- Q4. Adopt R1 server-side and gate the `override=true` path with it? Thresholds OK? (review-consensus.md O1–O2)
+- Q4. **Resolved (owner, 2026-11-14):** R1 is enforced server-side and gates `override=true`,
+  and Fix means "the conflict is real" (fix → contradicted). See M5, M7 and review-consensus.md.
 - Q5. `server/patches.py` cites other Wikipedia editions as `<ref>`s, which WP:CIRCULAR
   forbids. Switch to `claims.citation_urls`, or fall back to a talk-page notice only? (O3)
 
@@ -287,10 +357,13 @@ User directive: "compare over pages, not entities or topics". Pages must exist i
 - V-S12. **Q1 human override** (see Q1): `verdicts.apply_human_verdict` maps a
   review decision to a verdict — agree keeps the current verdict, disagree flips
   supported/possible_match↔contradicted (else unverifiable), fix →
-  definition_mismatch — stamps `verdict_source='human'`, confidence 1.0, and a
+  contradicted (changed from definition_mismatch by owner decision Q4) — stamps `verdict_source='human'`, confidence 1.0, and a
   new SVT row. `grade_links` skips any link already `verdict_source='human'`, so
   recheck/align never revert a human decision. Opt-in via the `override` request
   field on `POST /api/reviews` (default false).
+  **Superseded by M5:** `override=true` now runs `consensus.enforce` (R1 quorum)
+  instead of `apply_human_verdict`, which is kept but no longer called by the API.
+  Human links are regraded after a claim change (M7).
 - V-S13. **Indexes** (migration 003): `idx_claims_predicate`,
   `idx_claims_predicate_entity` (the alignment predicate guard and verdict
   filters). `idx_verdict` on `claim_links(verdict)` already existed. Verified:
@@ -337,3 +410,83 @@ User directive: "compare over pages, not entities or topics". Pages must exist i
   "Compare with sv · en" → `${webBase}/#/page/{lang}/{title}` (spaces as `_`).
 - V-W11. Drafts download file names use `{lang}-{title}-{type}-{id}.wiki` instead of the QID;
   drafts for this page are headed "This page", others "{Language} counterpart".
+
+## Assumed (review clarity, fewer rows, fix in every language, 2026-11-14)
+- C1. **Vote buttons are worded per verdict.** Conflict verdicts: "Real conflict" (agree) /
+  "False alarm" (disagree). Match verdicts: "Same fact" (agree) / "They conflict" (disagree).
+  unverifiable / definition_mismatch: "Not comparable" (agree) / "Real conflict" (fix). The
+  API decisions and policy R1 are unchanged. Fix no longer requires a note. Under the buttons
+  one line says how many more votes settle the verdict and what it becomes.
+- C2. **Confirming a possible verdict settles it** (`consensus.CONFIRMED_VERDICT`): a confirmed
+  `possible_conflict` is written as `contradicted`, a confirmed `possible_match` as `supported`.
+  Otherwise "Real conflict" on a possible conflict would never become a conflict.
+- C3. **Fallback guesses don't build rows.** Links graded while the LLM failed (HTTP 429) were
+  stored as `possible_match` / `unverifiable` with source `llm`. Migration 004 relabels them
+  `deterministic-fallback` (845 links), and `diff.connects()` ignores fallback weak links.
+  Daniel Tilas (sv) went from 1 row with 629 links to 30 rows with 3 conflicts.
+- C4. **Folded side pairs.** A row shows only its "main" links (same rule as `diff.connects`).
+  Unrelated pairs and fallback guesses sit under "N more pairs checked", rendered on first open.
+  Review progress counts main links only.
+- C5. **One-language facts are compact and hidden by default on busy pages.** missing_here /
+  only_here rows render as a short claim list. They are hidden when a page has more than 12 of
+  them; the filter bar has "Show facts found in only one language (N)". A status chip for a gap
+  status shows them regardless.
+- C6. **Fix it in every language** (`server/resolutions.py`, `web/js/resolve.js`, migration 004):
+  only on a reviewer-confirmed conflict (`contradicted` + `human`). A reviewer writes the correct
+  version once, in English, with an optional source (Wikimedia URLs are rejected, WP:CIRCULAR).
+  The server stores it in `resolutions` (SYSTEM VERSIONED) and writes one `suggestions` draft per
+  page of the comparison set (`resolution_id` set): "Replace: … With: …" when the page has a claim
+  in the row, "Add: …" otherwise, skipped when the page already says it. fi/sv text is translated
+  by the Verda LLM; if that fails, the English text goes in with a "translate before saving"
+  comment and the UI flags the draft. References are plain `<ref>[url host] (date)</ref>` so they
+  work on every edition. Nothing is submitted to Wikipedia; each draft has Copy, Open edit page
+  and Mark exported.
+- C7. Not changed: the alignment predicate guard still requires equal predicate strings, so
+  LLM-extracted claims with different predicate names (`birth_date` vs `date_of_birth`) are no
+  longer paired by a fresh alignment. Fewer claims at extraction time would need a re-run of
+  `jobs/extract_claims.py`.
+- C8. **Predicate aliases** (`server/predicates.py`): alignment's predicate guard, link cleanup
+  and the deterministic layer compare canonical predicates, so `date_of_birth` pairs with
+  `birth_date`. Only true synonyms are listed. Existing links are untouched (pairs are unique), so
+  this applies to new alignments. The extraction prompt now lists the canonical names.
+- C9. **Extraction fixes** (`jobs/extract_claims.py`): `--max-claims-per-page N` keeps typed
+  values first (dates, numbers), then the model's confidence. Old claims are deleted only after
+  the LLM calls (in a fresh transaction: MariaDB's snapshot isolation rejects the DELETE if
+  another article of the topic replaced shared links meanwhile), so the locks last
+  milliseconds instead of the whole run. `--reextract`
+  skips articles whose links have human reviews unless `--drop-reviews` is given, and keeps the
+  old claims if the model returns none. `kimi-k3-1-pro` reasons inside `max_tokens`: use
+  `--max-tokens 32000 --max-chars 4000`. Migration 006 adds the missing
+  `claims.data_quality_score` and `*_embeddings.embedding_quality` columns (every extraction
+  and every embedding INSERT failed without them).
+- C10. **Demo conflict for "fix it in every language"**: link 4 (Oskari Tokoi, en 15 April vs fi
+  15 May 1873) is confirmed by "OVR team (demo seed)" and "Kiro agent (demo seed)", both labelled
+  with a note. The three M8 seed conflicts keep one vote, so a judge's vote still completes them.
+  No resolution was pre-written: the correct version and its source are left to the reviewer.
+
+## Assumed (ML second-sweep salience reranking, global consistency & Verda deploy, 2026-11-14)
+- R-S1. **Hybrid ML + MariaDB HNSW Second-Sweep Reranker** (`jobs/rerank_claims.py`, migration 007 `claims.salience_score`):
+  Cuts bloated LLM extractions down to `--max-per-page 8` core, verifiable claims per page without
+  losing dynamic ML discovery. Combines three signals: (1) Verda `kimi-k3-1-pro` second-sweep
+  encyclopedic salience + primary-subject check (`about_subject`, dropping parent/relative tangents
+  such as Olof Tilas's 1719 ennoblement on Daniel Tilas's page) + same-edition deduplication,
+  (2) MariaDB `VEC_DISTANCE_COSINE` cross-edition resonance across `claim_embeddings`, and
+  (3) MariaDB `VEC_DISTANCE_COSINE` centrality to lead `chunk_idx=0`. Claims referenced by
+  `reviews`, `resolutions`, `suggestions`, or `contradicted` links are always protected; pruned
+  claims remain auditable in MariaDB SVT (`FOR SYSTEM_TIME ALL`).
+- R-S2. **Fast non-thinking extraction + review-safe augmentation** (`jobs/extract_claims.py`):
+  Disables reasoning tokens (`"thinking": {"type": "disabled"}`) and enforces thread-safe pacing
+  against Verda's 40 req/min headers (`x-ratelimit-remaining-requests` / `retry-after`), speeding
+  extraction ~75x with zero 429s. `--augment --top-conflicted N` enriches `rules-v1`-only dashboard
+  pages with dynamic second-sweep-reranked ML claims while preserving existing conflicted/reviewed
+  claims and demo votes intact.
+- R-S3. **Exact Landing <-> Compare count parity** (`server/pages.py`, `server/main.py`):
+  `pages.page_stats()` now computes exact row status counts via two bulk SQL queries and
+  `diff.build_rows()`, replacing the approximate SQL heuristic so `/api/pages/conflicted`,
+  `/api/pages?q=`, `/api/badge`, and `/api/pages/{id}/compare` always report identical numbers.
+- R-S4. **Two-tier MariaDB vector alignment, FK-safe cleanup & self-healing recheck**
+  (`server/alignment.py`, `server/recheck.py`, `server/regate.py`, `server/llm.py`):
+  Fixes `V-S14` (skips reviewed/suggested links in `clean_invalid_links`), pairs both canonical
+  predicate aliases and tight (`VEC_DISTANCE_COSINE <= 0.14`) open-predicate semantic neighbors for
+  batched `gate.py` verification, reuses a persistent HTTP keep-alive client in `llm.py`, and
+  auto-heals any unreviewed fallback/error links on recheck and via `regate.py --all --apply`.

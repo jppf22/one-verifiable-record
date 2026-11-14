@@ -34,10 +34,12 @@ shown.
 | POST | `/pages/{id}/align` | runs vector alignment + verdicts for the comparison set. Returns counts |
 | GET | `/pages/{id}/compare` | **Comparison payload** (below) |
 | POST | `/pages/{id}/recheck` | body `{focus_link_ids?}` → RecheckResult (as v1, `qid` replaced by `page_id`; counts use the v2 status keys) |
-| GET | `/pages/{id}/suggestions` | `{page_id, created, drafts:[{id, patch_type, wikitext, status, lang, title, page_id, claim_link_id}]}` |
+| GET | `/pages/{id}/suggestions` | `{page_id, created, drafts:[{id, patch_type, wikitext, status, lang, title, page_id, claim_link_id, resolution_id}]}` |
 | POST | `/suggestions/{id}/export` | as v1 (`recheck` is a RecheckResult for the draft's page) |
 | GET | `/claims/{id}/history` | unchanged |
 | POST/GET | `/reviews` | unchanged body. POST response `recheck` is for the page of claim_a |
+| POST | `/links/{id}/resolution` | body `{author, correct_text, source_url?}`. Only for a link with verdict `contradicted` and source `human` (409 otherwise). `correct_text` is English, 10–2000 chars; `source_url` must be http(s) and not on wikipedia.org / wikidata.org / wikimedia.org (422). Stores a `resolutions` row and one `suggestions` draft per page of the comparison set (fi/sv machine-translated). Returns `{resolution, drafts:[{id, page_id, lang, title, patch_type, wikitext, status, claim_link_id, resolution_id, untranslated}], skipped:[{page_id, lang, reason}]}` |
+| GET | `/links/{id}/resolution` | latest `{resolution, drafts}` of a link, or `{resolution: null, drafts: []}` |
 | GET | `/qa?page=&q=&lang=` | as v1, restricted to the comparison set of `page` |
 | GET | `/badge?lang=&title=` | `{page, counterparts, conflicts, missing_here, only_here, agree, counts}` |
 | GET | `/extension/resolve?lang=&wiki_page_id=&title=&live_revision_id=` | Extension resolver. Returns `{tracked:false}` for unsupported/unimported/ineligible pages; otherwise page/counterparts, summary counts, snapshot freshness and analysis state. `wiki_page_id` is authoritative; `title` is used only when it is absent. |
@@ -52,7 +54,8 @@ Remove the QID endpoints (`/articles`, `/merge/{qid}`, `/align/{qid}`, `/recheck
   "counterparts": [{page}],            // other-language pages, ordered fi, sv, en
   "summary": { "conflict": 2, "possible_conflict": 1, "missing_here": 5,
                "only_here": 3, "possible_match": 2, "agree": 9,
-               "links_total": 30, "links_reviewed": 1 },
+               "links_total": 30, "links_reviewed": 1,
+               "links_hidden": 12 },  // additive: candidate pairs ruled out (different_fact) or unreviewed non-connecting links
   "rows": [{
     "key": "r-1042",
     "status": "conflict | possible_conflict | missing_here | only_here | possible_match | agree",
@@ -60,9 +63,11 @@ Remove the QID endpoints (`/articles`, `/merge/{qid}`, `/align/{qid}`, `/recheck
     "here":  [claim],                                 // this page's claims in the row (may be empty)
     "there": { "sv": [claim], "en": [claim] },        // counterpart claims by lang (missing lang = absent)
     "links": [link]                                   // as v1, incl. id, verdict, verdict_source, similarity,
-  }]                                                  // evidence, rationale, computed_at, review
-}
+  }]                                                  // evidence, rationale, computed_at, review,
+}                                                     // consensus (if reviewed), resolution (if any)
 ```
+`link.resolution` (only on reviewer-confirmed conflicts that have one) =
+`{id, author, correct_text, source_url, created_at, drafts}` (`drafts` = count).
 `claim` = `{id, page_id, lang, kind, subject, subject_entity, predicate,
 predicate_entity, object_entity, value_text, value_normalized, value_canonical,
 qualifiers, context_text, citation_urls, extraction_confidence, statement_text,
@@ -78,6 +83,9 @@ Row status, **relative to this page**:
 - `agree`: claim here linked `supported` to every counterpart that has the fact.
 
 Rows are built from connected components over claim_links within the comparison set.
+Only `supported` / `contradicted` links, and `possible_match` / `possible_conflict` links
+that a grader actually produced, connect claims. Guesses written while the LLM was
+unavailable (`verdict_source = 'deterministic-fallback'`) stay attached as receipts only.
 Sort order: conflict, possible conflict, missing here, only here, possible match, agree.
 
 ## Frontend routes
