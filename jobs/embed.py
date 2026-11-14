@@ -71,6 +71,40 @@ def run(model: SentenceTransformer, table: str, batch_size: int, limit: int):
     return total
 
 
+def ensure_vector_index(table: str):
+    """Add the HNSW vector index once every row is embedded.
+
+    MariaDB 11.8 only allows a VECTOR INDEX on a NOT NULL column, so the
+    column is flipped to NOT NULL first (embeddings start as NULL, which is
+    what makes this job resumable). DISTANCE=cosine matches the
+    VEC_DISTANCE_COSINE queries in server/.
+    """
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*), SUM(embedding IS NULL) FROM {table}")
+    total, missing = cur.fetchone()
+    if not total or missing:
+        conn.close()
+        return
+    cur.execute(
+        "SELECT COUNT(*) FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_TYPE = 'VECTOR'",
+        (table,),
+    )
+    if cur.fetchone()[0]:
+        conn.close()
+        return
+    # ALTER on a system-versioned table (claims) needs this session flag
+    cur.execute("SET SESSION system_versioning_alter_history = 'KEEP'")
+    cur.execute(f"ALTER TABLE {table} MODIFY embedding VECTOR(1024) NOT NULL")
+    cur.execute(
+        f"CREATE VECTOR INDEX vidx_{table} ON {table} (embedding) M=8 DISTANCE=cosine"
+    )
+    conn.commit()
+    conn.close()
+    print(f"{table}: HNSW vector index vidx_{table} created", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-large"))
@@ -87,6 +121,7 @@ def main():
             sys.exit(f"unknown table: {table}")
         total = run(model, table, args.batch_size, args.limit)
         print(f"done: {table} ({total} rows)")
+        ensure_vector_index(table)
 
 
 if __name__ == "__main__":
