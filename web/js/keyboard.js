@@ -7,12 +7,12 @@ import { focusSearch, close as closeSearch } from "./search.js";
 
 const SHORTCUTS = [
   ["/", "Focus search"],
-  ["j / k", "Next / previous claim cluster"],
-  ["a", "Agree with the focused cluster's first unreviewed verdict"],
+  ["j / k", "Next / previous row"],
+  ["a", "Agree with the focused row's first unreviewed verdict"],
   ["d", "Disagree with it"],
   ["f", "Fix it (opens the note box)"],
-  ["h", "History (biography) of the focused cluster's first claim"],
-  ["r", "Re-check the page"],
+  ["h", "History (biography) of the focused row's first claim (this page's, if any)"],
+  ["r", "Re-check this page against its counterparts"],
   ["?", "Show this help"],
   ["Esc", "Close dialogs and menus"],
 ];
@@ -27,19 +27,19 @@ function openHelp() {
   if (!dlg.open) dlg.showModal();
 }
 
-function needCluster() {
+function needRow() {
   if (!merge.isActive()) return null;
-  let c = merge.focusedCluster();
-  if (!c) { merge.moveFocus(1); c = merge.focusedCluster(); }
-  if (!c) toast("No cluster to act on.", "info", 2000);
-  return c;
+  let r = merge.focusedRow();
+  if (!r) { merge.moveFocus(1); r = merge.focusedRow(); }
+  if (!r) toast("No row to act on.", "info", 2000);
+  return r;
 }
 
 function reviewFocused(decision) {
-  const c = needCluster();
-  if (!c) return;
-  const link = merge.firstUnreviewedLink(c);
-  if (!link) { toast("Every verdict in this cluster is already reviewed.", "info", 2500); return; }
+  const r = needRow();
+  if (!r) return;
+  const link = merge.firstUnreviewedLink(r);
+  if (!link) { toast("Every verdict in this row is already reviewed.", "info", 2500); return; }
   if (decision === "fix") reviewUi.openFix(link.id);
   else reviewUi.review(link.id, decision);
 }
@@ -63,8 +63,8 @@ function onKey(e) {
     case "d": reviewFocused("disagree"); break;
     case "f": e.preventDefault(); reviewFocused("fix"); break;
     case "h": {
-      const c = needCluster();
-      const first = c && (c.claims || [])[0];
+      const r = needRow();
+      const first = r && merge.firstClaim(r);
       if (first) emit("history:open", { claimId: Number(first.id) });
       break;
     }

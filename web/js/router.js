@@ -1,27 +1,38 @@
-/* Hash router: "#/" (article picker) and "#/merge/{QID}[?status=conflict,gap]".
- * The legacy "/?qid=Q…" link (used by the browser extension) is redirected to "#/merge/Q…". */
+/* Hash router: "#/" (landing: search + pages with conflicts) and
+ * "#/page/{lang}/{title}[?status=conflict,missing_here]" (comparison view of one page
+ * against its counterpart pages). Titles are URL-encoded with spaces as "_".
+ * Legacy links ("/?qid=…", "#/merge/…") are redirected to "#/". */
 
 const listeners = new Set();
 let current = null;
 
-const QID_RE = /^Q\d+$/i;
+const LANG_RE = /^[a-z][a-z-]{1,11}$/;
 
-/** Parse location.hash into {name, qid?, query: URLSearchParams}. */
-export function parse(hash = location.hash) {
-  const raw = hash.replace(/^#/, "") || "/";
-  const [path, qs = ""] = raw.split("?");
-  const query = new URLSearchParams(qs);
-  const m = path.match(/^\/merge\/([^/]+)\/?$/);
-  if (m) {
-    const qid = decodeURIComponent(m[1]).toUpperCase();
-    if (QID_RE.test(qid)) return { name: "merge", qid, query };
-  }
-  return { name: "picker", query };
+function decodeTitle(s) {
+  try { return decodeURIComponent(s).replace(/_/g, " ").trim(); } catch { return ""; }
+}
+export function encodeTitle(title) {
+  return encodeURIComponent(String(title).trim().replace(/ /g, "_"));
 }
 
-export function mergeHref(qid, query) {
+/** Parse location.hash into {name: "landing"|"page", lang?, title?, query}. */
+export function parse(hash = location.hash) {
+  const raw = hash.replace(/^#/, "") || "/";
+  const qi = raw.indexOf("?");
+  const path = qi < 0 ? raw : raw.slice(0, qi);
+  const query = new URLSearchParams(qi < 0 ? "" : raw.slice(qi + 1));
+  const m = path.match(/^\/page\/([^/]+)\/(.+?)\/?$/);
+  if (m) {
+    const lang = decodeTitle(m[1]).toLowerCase();
+    const title = decodeTitle(m[2]);
+    if (LANG_RE.test(lang) && title) return { name: "page", lang, title, key: `${lang}:${title}`, query };
+  }
+  return { name: "landing", query };
+}
+
+export function pageHref(lang, title, query) {
   const qs = query && [...query].length ? `?${query}` : "";
-  return `#/merge/${encodeURIComponent(qid)}${qs}`;
+  return `#/page/${encodeURIComponent(lang)}/${encodeTitle(title)}${qs}`;
 }
 
 /** Navigate (adds a history entry, fires the route listeners). */
@@ -30,8 +41,8 @@ export function go(hash) {
   location.hash = hash;
 }
 
-export function openMerge(qid) { go(mergeHref(qid)); }
-export function openPicker() { go("#/"); }
+export function openPage(lang, title) { go(pageHref(lang, title)); }
+export function openLanding() { go("#/"); }
 
 /** Update the query part of the current route WITHOUT a new history entry or re-route
  * (used to persist filters like ?status= in the URL). */
@@ -42,7 +53,7 @@ export function replaceQuery(params) {
     if (v == null || v === "" || (Array.isArray(v) && !v.length)) query.delete(k);
     else query.set(k, Array.isArray(v) ? v.join(",") : String(v));
   }
-  const base = r.name === "merge" ? `#/merge/${encodeURIComponent(r.qid)}` : "#/";
+  const base = r.name === "page" ? pageHref(r.lang, r.title) : "#/";
   const qs = [...query].length ? `?${query}` : "";
   history.replaceState(history.state, "", `${location.pathname}${base}${qs}`);
   current = parse();
@@ -62,14 +73,15 @@ function dispatch() {
 }
 
 export function init() {
-  // Legacy deep link: /?qid=Q123 -> /#/merge/Q123 (assumption A5).
-  const legacy = new URLSearchParams(location.search).get("qid");
-  if (legacy && QID_RE.test(legacy.trim())) {
-    history.replaceState(null, "", `/${mergeHref(legacy.trim().toUpperCase())}`);
-  } else if (location.search && !location.hash) {
-    history.replaceState(null, "", `/${location.hash || "#/"}`);
+  // Legacy deep links (/?qid=…, #/merge/…) no longer map to a page: send them to the landing.
+  const legacyHash = /^#\/merge\//.test(location.hash);
+  if (location.search || legacyHash) {
+    history.replaceState(null, "", `${location.pathname}${legacyHash || !location.hash ? "#/" : location.hash}`);
   }
-  window.addEventListener("hashchange", dispatch);
+  window.addEventListener("hashchange", () => {
+    if (/^#\/merge\//.test(location.hash)) { history.replaceState(null, "", `${location.pathname}#/`); }
+    dispatch();
+  });
 }
 
 /** Fire the initial route once every module is initialised. */

@@ -2,6 +2,7 @@
 import { $, esc, getReviewer, setReviewer } from "./util.js";
 import * as router from "./router.js";
 import * as search from "./search.js";
+import * as landing from "./landing.js";
 import * as merge from "./merge.js";
 import * as review from "./review.js";
 import * as keyboard from "./keyboard.js";
@@ -33,17 +34,18 @@ function initReviewerChip() {
 }
 
 function showRoute(route, prev) {
-  const isMerge = route.name === "merge";
+  const isPage = route.name === "page";
   document.body.dataset.route = route.name;
-  $("#article-picker").hidden = isMerge;
-  $("#merge-view").hidden = !isMerge;
+  $("#landing").hidden = isPage;
+  $("#compare-view").hidden = !isPage;
   search.close();
-  if (isMerge) {
-    merge.open(route.qid, route.query);
-    if (prev?.qid !== route.qid) window.scrollTo(0, 0);
+  if (isPage) {
+    merge.open(route, route.query);
+    if (prev?.key !== route.key) window.scrollTo(0, 0);
   } else {
     merge.close();
-    if (prev && prev.name !== "picker") $("#search-input").focus();
+    landing.load({ force: true });
+    if (prev && prev.name !== "landing") $("#search-input").focus();
   }
 }
 
@@ -54,6 +56,7 @@ function safeInit(name, mod) {
 router.init();
 initReviewerChip();
 safeInit("search", search);
+safeInit("landing", landing);
 safeInit("merge", merge);
 safeInit("review", review);
 safeInit("keyboard", keyboard);

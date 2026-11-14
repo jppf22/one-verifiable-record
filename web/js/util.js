@@ -18,10 +18,9 @@ export function esc(s) {
 export const LANGS = ["fi", "sv", "en"];
 export const LANG_NAMES = { fi: "Finnish", sv: "Swedish", en: "English" };
 
-/** Permanent link to an exact revision, or the article if no revision is known. */
+/** Permanent link to an exact imported revision. Never fall back to live Wikipedia. */
 export function wikiUrl(lang, revisionId, title) {
   if (revisionId) return `https://${lang}.wikipedia.org/w/index.php?oldid=${encodeURIComponent(revisionId)}`;
-  if (title) return `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
   return null;
 }
 
@@ -61,4 +60,19 @@ export function fmtTime(ts) {
 export function debounce(fn, ms = 250) {
   let t;
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+/** Sort key for language codes: fi, sv, en first, then alphabetical. */
+export function langRank(l) { const i = LANGS.indexOf(l); return i < 0 ? LANGS.length : i; }
+export function sortByLang(items, get = (x) => x.lang) {
+  return [...items].sort((a, b) => langRank(get(a)) - langRank(get(b)) || String(get(a)).localeCompare(String(get(b))));
+}
+
+/** Only allow http(s) links from the API into href attributes. */
+export function safeUrl(u) { return /^https?:\/\//i.test(u || "") ? u : null; }
+
+/** Permanent link to the page's imported revision, if the snapshot recorded one. */
+export function pageRevUrl(p) {
+  if (!p?.revision_id) return null;
+  return safeUrl(p.url) || safeUrl(wikiUrl(p.lang, p.revision_id, p.title));
 }

@@ -3,46 +3,76 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>One Verifiable Record</title>
+  <title>One Verifiable Record — Wikipedia consistency desk</title>
   <link rel="stylesheet" href="/css/base.css">
   <link rel="stylesheet" href="/css/merge.css">
   <link rel="stylesheet" href="/css/panels.css">
 </head>
-<body data-route="picker">
+<body data-route="landing">
   <header id="app-header">
+    <div class="wordmark" aria-hidden="true"><span>W</span><i>V</i></div>
     <div class="brand">
       <a href="#/" class="home-link"><h1>One Verifiable Record</h1></a>
-      <p class="tagline">Wikipedia editions are branches. This is the merge tool.</p>
+      <p class="tagline">The cross-language Wikipedia consistency desk</p>
     </div>
-    <div id="reviewer-slot"></div>
+    <div class="account-area"><div id="reviewer-slot"></div></div>
     <form id="search-form" role="search">
+      <label class="sr-only" for="search-input">Search imported Wikipedia articles</label>
       <div class="search-box">
-        <input id="search-input" placeholder="Search an article tracked across fi / sv / en… (press /)" autocomplete="off" spellcheck="false" aria-label="Search articles">
-        <div id="results" class="results" role="listbox" aria-label="Matching articles" hidden></div>
+        <input id="search-input" placeholder="Search Wikipedia articles (press /)" autocomplete="off" spellcheck="false" aria-label="Search pages by title" aria-expanded="false">
+        <div id="results" class="results" role="listbox" aria-label="Matching pages" hidden></div>
       </div>
-      <button type="submit">Open merge view</button>
+      <button type="submit" class="search-submit">Compare</button>
     </form>
+    <nav class="page-tabs" aria-label="Project navigation">
+      <a class="active" href="#/">Project page</a>
+      <a href="https://www.wikipedia.org/" target="_blank" rel="noopener">Wikipedia ↗</a>
+      <a href="#about">About this tool</a>
+    </nav>
   </header>
 
+  <div class="wiki-layout">
+    <aside class="wiki-rail" aria-label="Project navigation">
+      <nav>
+        <p class="rail-label">Navigation</p>
+        <a href="#/">Main page</a>
+        <a href="#conflicted-title">Open conflicts</a>
+        <a href="#about">How to read results</a>
+        <p class="rail-label">Tools</p>
+        <a href="#/">Compare articles</a>
+        <a href="#/">Recent changes</a>
+        <a href="https://www.wikipedia.org/" target="_blank" rel="noopener">Visit Wikipedia ↗</a>
+      </nav>
+      <p class="rail-note">A research and editorial aid. It never edits Wikipedia automatically.</p>
+    </aside>
   <main id="main">
-    <section id="article-picker">
-      <p class="muted">Search for an article to see how the Finnish, Swedish and English
-      editions agree, conflict, or leave gaps in each other.</p>
+    <section id="landing">
+      <div class="article-lead">
+        <p class="page-kicker">Cross-language reference check</p>
+        <h2>Compare editions, claim by claim</h2>
+        <p>Pick an article to compare it with pages about the same subject in the Finnish, Swedish, and English Wikipedias. Each finding is read from the selected article’s point of view.</p>
+      </div>
       <ul class="legend">
-        <li><span class="badge conflict">Conflict</span> the editions contradict each other</li>
-        <li><span class="badge gap">Gap</span> one edition has a fact the others lack</li>
-        <li><span class="badge agree">Agree</span> every edition says the same thing</li>
+        <li><span class="badge conflict">Conflict</span> this page and a counterpart page contradict each other</li>
+        <li><span class="badge missing_here">Missing here</span> a counterpart page states it, this page doesn't</li>
+        <li><span class="badge only_here">Only here</span> this page states it, no counterpart page does</li>
+        <li><span class="badge agree">Agree</span> every counterpart page that has the fact says the same thing</li>
       </ul>
-      <p class="muted">Every verdict carries receipts: the source passage, the revision id and a
-      link back to Wikipedia. Press <kbd>?</kbd> for keyboard shortcuts.</p>
+      <p class="editorial-note">Every finding includes its source passage, revision ID, and a link back to Wikipedia. Press <kbd>?</kbd> for keyboard shortcuts.</p>
+      <h2 id="conflicted-title">Pages with conflicts</h2>
+      <div id="conflicted-pages" aria-labelledby="conflicted-title"></div>
+      <section id="about" class="about-box" aria-labelledby="about-title">
+        <h2 id="about-title">About this tool</h2>
+        <p>One Verifiable Record treats language editions as parallel records of the same subject. It highlights differences for people to inspect; it does not decide which edition is correct.</p>
+      </section>
     </section>
 
-    <section id="merge-view" hidden>
-      <div id="merge-header"></div>
+    <section id="compare-view" hidden>
+      <div id="compare-header"></div>
       <div id="summary-bar"></div>
       <div id="filters"></div>
       <div id="recheck-banner" hidden></div>
-      <div id="clusters"></div>
+      <div id="rows"></div>
       <section id="suggestions"></section>
       <section id="qa"></section>
     </section>
@@ -51,6 +81,8 @@
   <dialog id="history-dialog"></dialog>
   <dialog id="help-dialog"></dialog>
   <div id="toasts" aria-live="polite"></div>
+
+  </div>
 
   <script type="module" src="/js/main.js"></script>
 </body>

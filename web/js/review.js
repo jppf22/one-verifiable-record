@@ -1,5 +1,5 @@
 /* Inline human review on each verdict row: Agree / Disagree / Fix (+ required note).
- * Posts to /api/reviews; the server re-checks the article and returns a RecheckResult,
+ * Posts to /api/reviews; the server re-checks the page and returns a RecheckResult,
  * which is forwarded as `recheck:done` (reason "review"). A review never overrides the
  * machine verdict (user-confirmed decision #4). */
 import { api } from "./api.js";
@@ -12,7 +12,7 @@ const DECISIONS = {
   fix: { label: "Fix", icon: "✎", hint: "Needs a fix: describe it in a note" },
 };
 
-let ctx = { getLink: () => null, getQid: () => null };
+let ctx = { getLink: () => null, getPageId: () => null };
 const pending = new Set();
 
 /** merge.js provides lookups so this module needs no import cycle. */
@@ -90,7 +90,7 @@ export async function review(linkId, decision, note = "") {
   const reviewer = ensureReviewer();
   if (!reviewer) { toast("A reviewer name is needed to submit reviews.", "warn"); return false; }
 
-  const qid = ctx.getQid();
+  const pageId = ctx.getPageId();
   const link = ctx.getLink(linkId);
   const previous = link ? link.review : null;
   const optimistic = { decision, reviewer, note: note.trim() || null, created_at: new Date().toISOString() };
@@ -108,8 +108,9 @@ export async function review(linkId, decision, note = "") {
     setStamp(linkId, link?.review || optimistic, false);
     closeFix(linkId);
     toast(`Review saved (${DECISIONS[decision].label.toLowerCase()}). Page re-checked.`, "ok");
-    if (res && res.recheck) emit("recheck:done", { qid, result: res.recheck, reason: "review", linkIds: [linkId] });
-    else emit("merge:reload", { qid });
+    // The server re-checks the page of claim_a; we re-render the page we are looking at.
+    if (res && res.recheck) emit("recheck:done", { pageId, result: res.recheck, reason: "review", linkIds: [linkId] });
+    else emit("page:reload", { pageId });
     return true;
   } catch (err) {
     pending.delete(linkId);
@@ -121,7 +122,7 @@ export async function review(linkId, decision, note = "") {
 }
 
 export function init() {
-  const host = $("#clusters");
+  const host = $("#rows");
   host.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-review]");
     if (btn) {

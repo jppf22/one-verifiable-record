@@ -257,3 +257,48 @@ dialog.hist-dialog {
   .hist-spinner, .qa-spinner, .sg-skeleton div { animation: none; }
   .sg-pre.collapsed { -webkit-mask-image: none; mask-image: none; }
 }
+
+/* ---------- editorial panels: MediaWiki-derived paper, not app chrome ---------- */
+.sg .primary, .qa .primary { background: #36c; border-color: #36c; color: #fff; }
+.sg .primary:hover:not(:disabled), .qa .primary:hover:not(:disabled) { background: #447ff5; border-color: #447ff5; }
+.sg .linkish, .qa .linkish { color: #36c; font-weight: 400; }
+.hist-spinner, .qa-spinner { border-color: #c8ccd1; border-top-color: #36c; }
+dialog.hist-dialog { border-radius: 2px; box-shadow: 0 8px 28px rgba(0,0,0,.28); }
+.hist-inner { padding: 20px 22px 24px; }
+.hist-head { padding-bottom: 10px; border-bottom: 1px solid #a2a9b1; }
+.hist-head h2 { font-family: Georgia, "Times New Roman", serif; font-size: 25px; }
+.hist-close { border-radius: 2px; }
+.hist-tools { margin: 12px 0; border: 1px solid #c8ccd1; border-radius: 2px; background: #f8f9fa; }
+.hist-powered b { color: #36c; }
+.hist-sql pre, .sg-pre { border-radius: 1px; border-color: #c8ccd1; background: #f8f9fa; color: #202122; }
+.hist-timeline::before { background: #a2a9b1; }
+.hist-dot { border-radius: 2px; background: #fff; border-color: #a2a9b1; color: #54595d; }
+.hist-event.live .hist-dot { box-shadow: 0 0 0 4px #eaf3ff; }
+.hist-card { border-radius: 2px; border-color: #c8ccd1; background: #fff; }
+.hist-event.live .hist-card { border-color: #36c; }
+.hist-current-chip, .hist-verdict, .hist-step { border-radius: 2px; }
+.hist-evidence blockquote, .qa-passage blockquote { border-left-color: #a2a9b1; background: #f8f9fa; }
+.hist-del { background: #fee7e6; color: #b32424; }
+.hist-ins { background: #d5fdf4; color: #14866d; }
+
+#suggestions.sg, #qa.qa { margin-top: 42px; padding-top: 4px; border-top: 1px solid #a2a9b1; }
+.sg-head h2, .qa h2 { font-family: Georgia, "Times New Roman", serif; }
+.sg-notice { border-radius: 2px; border-color: #e0c06f; background: #fdf3d5; color: #54595d; }
+.sg-notice b { color: #6b4c00; }
+.sg-state { border-radius: 2px; background: #f8f9fa; }
+.sg-skeleton div { border-radius: 2px; background: #eaecf0; border-color: #c8ccd1; }
+.sg-lang { border-top: 1px solid #c8ccd1; padding-top: 14px; }
+.sg-lang h3 { font-family: Georgia, "Times New Roman", serif; }
+.sg-lang-code, .sg-chip, .qa-lang-tag { border-radius: 2px; }
+.sg-lang-code, .qa-lang-tag { background: #eaf3ff; color: #36c; }
+.sg-draft { border-radius: 2px; border-color: #c8ccd1; background: #fff; box-shadow: 0 1px 1px rgba(0,0,0,.04); }
+.sg-chip.type { background: #eaf3ff; color: #36c; }
+.sg-pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sg .button { border-radius: 2px; background: #f8f9fa; color: #202122; }
+.sg-note { border-radius: 2px; background: #f8f9fa; }
+.qa-form select { border-radius: 2px; background: #fff; }
+.qa .chip { border-radius: 2px; background: #f8f9fa; }
+.qa-card { border-radius: 2px; border-color: #c8ccd1; border-left-color: #36c; background: #fff; }
+.qa-cite[aria-expanded="true"] { border-color: #36c; background: #eaf3ff; }
+.qa-past { border-radius: 2px; border-color: #c8ccd1; background: #f8f9fa; }
+.qa-past .qa-card { border-radius: 0; }

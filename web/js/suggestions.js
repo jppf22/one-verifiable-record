@@ -1,17 +1,18 @@
 /* Patch suggestions: export-only wikitext drafts for human editors.
- * Owner: panels. Renders into #suggestions on bus `article:loaded`.
+ * Owner: panels. Renders into #suggestions on bus `page:loaded` (drafts for this page and
+ * its counterpart pages, from GET /api/pages/{id}/suggestions).
  * We NEVER edit Wikipedia: the only outbound action is a link a human clicks. */
 import { api } from "./api.js";
 import { on, emit } from "./bus.js";
 import { $, esc, toast, LANGS, LANG_NAMES } from "./util.js";
 
-const TYPE_LABEL = { wikitext: "Article text", citation: "Citation", talk_page: "Talk page" };
+const TYPE_LABEL = { wikitext: "Page text", citation: "Citation", talk_page: "Talk page" };
 const TYPE_ORDER = ["wikitext", "citation", "talk_page"];
 const LONG_CHARS = 420;
 const LONG_LINES = 8;
 
 let root;
-let state = null; // { qid, titles: {lang: title}, drafts: [], loading, error, notes: {id: html} }
+let state = null; // { pageId, page, titles: {lang: title}, drafts: [], loading, error, notes: {id: html} }
 let seq = 0;
 
 export function init() {
@@ -19,13 +20,14 @@ export function init() {
   if (!root) return;
   root.classList.add("sg");
   root.addEventListener("click", onClick);
-  on("article:loaded", ({ qid, data } = {}) => {
+  on("page:loaded", ({ pageId, data } = {}) => {
     const titles = {};
-    for (const a of data?.articles || []) titles[a.lang] = a.title;
-    // Same article reloaded (e.g. after a re-check): keep the drafts already shown.
-    if (state && state.qid === qid) { state.titles = titles; render(); return; }
+    for (const p of [data?.page, ...(data?.counterparts || [])]) if (p) titles[p.lang] = p.title;
+    const page = data?.page || null;
+    // Same page reloaded (e.g. after a re-check): keep the drafts already shown.
+    if (state && state.pageId === pageId) { state.titles = titles; state.page = page; render(); return; }
     seq++;
-    state = { qid, titles, drafts: [], loaded: false, loading: false, error: null, notes: {}, expanded: new Set() };
+    state = { pageId, page, titles, drafts: [], loaded: false, loading: false, error: null, notes: {}, expanded: new Set() };
     render();
   });
 }
@@ -48,11 +50,11 @@ function render() {
     </div>
     <p class="sg-notice" role="note"><b>Export-only.</b> We never edit Wikipedia automatically.
       Drafts are wikitext for a human editor to review, copy and apply by hand.
-      Marking a draft as exported re-checks the article and reports whether the conflict resurfaces.</p>
+      Marking a draft as exported re-checks this page against its counterparts and reports whether the conflict resurfaces.</p>
     ${loading && !count ? skeleton() : ""}
     ${error ? `<div class="sg-state error" role="alert">Could not generate drafts: ${esc(error)}
         <button type="button" class="sg-generate">Retry</button></div>` : ""}
-    ${loaded && !count && !error ? `<div class="sg-state">No drafts: there are no conflicts or gaps to patch for this article.</div>` : ""}
+    ${loaded && !count && !error ? `<div class="sg-state">No drafts: there are no conflicts or missing facts to patch on this page or its counterparts.</div>` : ""}
     ${count ? groups() : ""}`;
 }
 
@@ -71,8 +73,9 @@ function groups() {
   return langs.map((lang) => {
     const list = byLang.get(lang);
     const types = [...new Set(list.map((d) => d.patch_type))].sort((a, b) => rank(TYPE_ORDER, a) - rank(TYPE_ORDER, b));
+    const isHere = state.page && state.page.lang === lang;
     return `<section class="sg-lang" aria-label="${esc(LANG_NAMES[lang] || lang)} drafts">
-        <h3><span class="sg-lang-code">${esc(lang)}</span> ${esc(LANG_NAMES[lang] || "")}
+        <h3><span class="sg-lang-code">${esc(lang)}</span> ${isHere ? "This page" : `${esc(LANG_NAMES[lang] || "")} counterpart`}
           <span class="muted">${esc(titleFor({ lang }))} · ${list.length} draft(s)</span></h3>
         ${types.map((t) => `
           <div class="sg-type">
@@ -146,11 +149,11 @@ function onClick(e) {
 
 async function generate() {
   const my = ++seq;
-  const qid = state.qid;
+  const pageId = state.pageId;
   state.loading = true; state.error = null;
   render();
   try {
-    const res = await api.suggestions(qid);
+    const res = await api.suggestions(pageId);
     if (my !== seq) return;
     state.drafts = res.drafts || [];
     state.loaded = true;
@@ -166,7 +169,7 @@ async function generate() {
 
 async function markExported(draft, btn) {
   const my = seq;
-  const qid = state.qid;
+  const pageId = state.pageId;
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   btn.textContent = draft.claim_link_id != null ? "Exporting + re-checking…" : "Exporting…";
@@ -188,16 +191,17 @@ async function markExported(draft, btn) {
   render();
   root.querySelector(`.sg-draft[data-id="${CSS.escape(String(draft.id))}"] .sg-copy`)?.focus();
   toast(`Draft #${draft.id} marked exported`, "ok");
-  if (recheck) emit("recheck:done", { qid, result: recheck, reason: "export" });
+  // The server re-checks the draft's page; refresh the comparison we are looking at.
+  if (recheck) emit("recheck:done", { pageId, result: recheck, reason: "export" });
 }
 
 function recheckNote(draft, r) {
   if (!r) return `Marked exported. This draft is not tied to a single link, so no re-check ran.`;
   const link = (r.links || []).find((l) => String(l.id) === String(draft.claim_link_id));
-  if (!link) return `Re-checked the article: no change reported for link #${esc(draft.claim_link_id)}.`;
+  if (!link) return `Re-checked the page: no change reported for link #${esc(draft.claim_link_id)}.`;
   if (link.resurfaced) {
     return `<b class="bad">Conflict resurfaces.</b> Link #${esc(link.id)} is still <code>${esc(link.after)}</code>
-      in the stored revisions. Apply the patch on Wikipedia, then re-import.`;
+      in the stored revisions. Apply the patch on Wikipedia, then re-import the page.`;
   }
   if (link.changed) {
     return `<b class="ok">Verdict changed:</b> <code>${esc(link.before ?? "new link")}</code> → <code>${esc(link.after)}</code> for link #${esc(link.id)}.`;
@@ -209,7 +213,7 @@ function recheckNote(draft, r) {
 
 function fileName(d) {
   const safe = (s) => String(s ?? "").replace(/[^A-Za-z0-9._-]+/g, "_");
-  return `${safe(state.qid)}-${safe(d.lang)}-${safe(d.patch_type)}-${safe(d.id)}.wiki`;
+  return `${safe(d.lang)}-${safe(titleFor(d))}-${safe(d.patch_type)}-${safe(d.id)}.wiki`;
 }
 
 function download(name, text) {
@@ -224,8 +228,9 @@ function download(name, text) {
 function downloadAll() {
   const parts = state.drafts.map((d) =>
     `<!-- ===== draft #${d.id} · ${d.lang} · ${d.patch_type} · ${titleFor(d)} · status: ${d.status || "draft"} ===== -->\n${d.wikitext ?? ""}\n`);
-  const header = `<!-- One Verifiable Record patch drafts for ${state.qid}. Export-only: review and apply by hand. -->\n\n`;
-  download(`${String(state.qid).replace(/[^A-Za-z0-9_-]+/g, "_")}-patches.wiki`, header + parts.join("\n"));
+  const p = state.page || {};
+  const header = `<!-- One Verifiable Record patch drafts for ${p.lang}:${p.title} and its counterpart pages. Export-only: review and apply by hand. -->\n\n`;
+  download(`${`${p.lang || "page"}-${p.title || state.pageId}`.replace(/[^A-Za-z0-9_-]+/g, "_")}-patches.wiki`, header + parts.join("\n"));
 }
 
 async function copy(text) {

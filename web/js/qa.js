@@ -1,20 +1,20 @@
-/* Grounded Q&A over the article's passages in every language edition.
- * Owner: panels. Renders into #qa on bus `article:loaded`. */
+/* Grounded Q&A over the passages of this page and its counterpart pages.
+ * Owner: panels. Renders into #qa on bus `page:loaded`. GET /api/qa?page=&q=&lang= */
 import { api } from "./api.js";
 import { on } from "./bus.js";
 import { $, esc, LANGS, LANG_NAMES, wikiUrl } from "./util.js";
 
 const SUGGESTED = [
   "When was it founded?",
-  "What numbers do the editions disagree on?",
+  "Which numbers differ between the language versions?",
   "What are the key dates and figures?",
-  "What does one edition mention that the others leave out?",
+  "What does one page mention that the others leave out?",
 ];
 const HISTORY_MAX = 6;
-const STORE_KEY = (qid) => `ovr.qa.${qid}`;
+const STORE_KEY = (pageId) => `ovr.qa.page.${pageId}`;
 
 let root;
-let ctx = null; // { qid, langs, current, loading, error }
+let ctx = null; // { pageId, page, langs, current, loading, error }
 let seq = 0;
 
 export function init() {
@@ -23,12 +23,13 @@ export function init() {
   root.classList.add("qa");
   root.addEventListener("submit", onSubmit);
   root.addEventListener("click", onClick);
-  on("article:loaded", ({ qid, data } = {}) => {
-    const langs = [...new Set((data?.articles || []).map((a) => a.lang))]
-      .sort((a, b) => rank(a) - rank(b));
-    if (ctx && ctx.qid === qid) { ctx.langs = langs; renderShell(true); return; }
+  on("page:loaded", ({ pageId, data } = {}) => {
+    const pages = [data?.page, ...(data?.counterparts || [])].filter(Boolean);
+    const langs = [...new Set(pages.map((p) => p.lang))].sort((a, b) => rank(a) - rank(b));
+    const page = data?.page || null;
+    if (ctx && ctx.pageId === pageId) { ctx.langs = langs; ctx.page = page; renderShell(true); return; }
     seq++;
-    ctx = { qid, langs, current: null, loading: false, error: null };
+    ctx = { pageId, page, langs, current: null, loading: false, error: null };
     renderShell(false);
   });
 }
@@ -38,10 +39,10 @@ const rank = (l) => { const i = LANGS.indexOf(l); return i < 0 ? LANGS.length : 
 /* ---------- session history ---------- */
 
 function loadHistory() {
-  try { return JSON.parse(sessionStorage.getItem(STORE_KEY(ctx.qid))) || []; } catch { return []; }
+  try { return JSON.parse(sessionStorage.getItem(STORE_KEY(ctx.pageId))) || []; } catch { return []; }
 }
 function saveHistory(list) {
-  try { sessionStorage.setItem(STORE_KEY(ctx.qid), JSON.stringify(list.slice(0, HISTORY_MAX))); } catch { /* quota/private mode */ }
+  try { sessionStorage.setItem(STORE_KEY(ctx.pageId), JSON.stringify(list.slice(0, HISTORY_MAX))); } catch { /* quota/private mode */ }
 }
 
 /* ---------- rendering ---------- */
@@ -50,17 +51,18 @@ function renderShell(keepInput) {
   const prevQ = keepInput ? root.querySelector("#qa-input")?.value : "";
   const prevLang = keepInput ? root.querySelector("#qa-lang")?.value : "";
   root.innerHTML = `
-    <h2 id="qa-title">Ask the article</h2>
-    <p class="muted">Answers are grounded in passages retrieved with MariaDB vector search across
-      ${ctx.langs.length ? ctx.langs.map((l) => esc(l)).join(" / ") : "every"} edition(s), with a citation for each source.</p>
+    <h2 id="qa-title">Ask this page and its counterparts</h2>
+    <p class="muted">Searches this page${ctx.page ? ` (${esc(ctx.page.lang)} · ${esc(ctx.page.title)})` : ""} and its counterpart pages
+      ${ctx.langs.length > 1 ? `in ${ctx.langs.map((l) => esc(l)).join(" / ")}` : ""}. Answers are grounded in passages retrieved
+      with MariaDB vector search, with a citation for each source.</p>
     <form id="qa-form" class="qa-form" aria-labelledby="qa-title">
       <label class="sr-only" for="qa-input">Question</label>
       <input id="qa-input" name="q" type="text" minlength="2" maxlength="500" required
-        placeholder="Ask a question about this article…" autocomplete="off">
+        placeholder="Ask a question about this page and its counterparts…" autocomplete="off">
       <label class="sr-only" for="qa-lang">Language</label>
-      <select id="qa-lang" name="lang" title="Restrict sources to one edition">
-        <option value="">All editions</option>
-        ${ctx.langs.map((l) => `<option value="${esc(l)}">${esc(l)} · ${esc(LANG_NAMES[l] || l)}</option>`).join("")}
+      <select id="qa-lang" name="lang" title="Restrict sources to one page">
+        <option value="">All pages</option>
+        ${ctx.langs.map((l) => `<option value="${esc(l)}">${esc(l)} · ${l === ctx.page?.lang ? "this page only" : `${esc(LANG_NAMES[l] || l)} counterpart only`}</option>`).join("")}
       </select>
       <button type="submit" class="primary qa-ask">Ask</button>
     </form>
@@ -169,13 +171,13 @@ function onClick(e) {
 
 async function ask(q, lang) {
   const my = ++seq;
-  const qid = ctx.qid;
+  const pageId = ctx.pageId;
   ctx.last = { q, lang };
   ctx.loading = true; ctx.error = null; ctx.current = null;
   renderAnswer();
   renderHistory();
   try {
-    const res = await api.qa(qid, q, lang);
+    const res = await api.qa(pageId, q, lang);
     if (my !== seq) return;
     const item = { question: res.question || q, lang, answer: res.answer, citations: res.citations || [], at: Date.now() };
     ctx.current = item;

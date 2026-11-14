@@ -1,4 +1,4 @@
-/* Fetch wrappers for every endpoint in docs/frontend-contract.md. All requests go via /api (nginx proxy). */
+/* Fetch wrappers for the page-centric (v2) endpoints in docs/page-contract.md. All requests go via /api (nginx proxy). */
 const API = "/api";
 const enc = encodeURIComponent;
 
@@ -26,17 +26,24 @@ async function request(path, { method = "GET", body } = {}) {
 }
 
 export const api = {
-  searchArticles: (q) => request(`/articles?q=${enc(q)}`),
-  align: (qid) => request(`/align/${enc(qid)}`, { method: "POST" }),
-  merge: (qid) => request(`/merge/${enc(qid)}`),
-  recheck: (qid, focusLinkIds = []) =>
-    request(`/recheck/${enc(qid)}`, { method: "POST", body: { focus_link_ids: focusLinkIds } }),
+  /** Title search: [{page, counterparts, conflicts}]. Only pages with >= 1 counterpart. */
+  searchPages: (q, lang) => request(`/pages?q=${enc(q)}${lang ? `&lang=${enc(lang)}` : ""}`),
+  /** Landing list: [{page, counterparts, conflicts, missing_here, only_here, agree}]. */
+  conflictedPages: (limit = 50) => request(`/pages/conflicted?limit=${enc(limit)}`),
+  /** {page, counterparts} or a 404 ApiError. */
+  pageByTitle: (lang, title) => request(`/pages/by-title?lang=${enc(lang)}&title=${enc(title)}`),
+  page: (id) => request(`/pages/${enc(id)}`),
+  align: (pageId) => request(`/pages/${enc(pageId)}/align`, { method: "POST" }),
+  compare: (pageId) => request(`/pages/${enc(pageId)}/compare`),
+  recheck: (pageId, focusLinkIds = []) =>
+    request(`/pages/${enc(pageId)}/recheck`, { method: "POST", body: { focus_link_ids: focusLinkIds } }),
   claimHistory: (claimId) => request(`/claims/${enc(claimId)}/history`),
   reviews: (linkId) => request(`/reviews?link_id=${enc(linkId)}`),
   submitReview: ({ claim_link_id, reviewer, decision, note }) =>
     request(`/reviews`, { method: "POST", body: { claim_link_id, reviewer, decision, note } }),
-  suggestions: (qid) => request(`/suggestions/${enc(qid)}`),
+  suggestions: (pageId) => request(`/pages/${enc(pageId)}/suggestions`),
   exportSuggestion: (id) => request(`/suggestions/${enc(id)}/export`, { method: "POST" }),
-  qa: (qid, q, lang) =>
-    request(`/qa?qid=${enc(qid)}&q=${enc(q)}${lang ? `&lang=${enc(lang)}` : ""}`),
+  /** Grounded Q&A over this page and its counterpart pages. */
+  qa: (pageId, q, lang) =>
+    request(`/qa?page=${enc(pageId)}&q=${enc(q)}${lang ? `&lang=${enc(lang)}` : ""}`),
 };

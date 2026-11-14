@@ -1,14 +1,14 @@
-/* Live article search: debounced as-you-type (min 2 chars), keyboard selectable
- * results (ArrowUp/ArrowDown/Enter, Esc closes), loading / empty / error states. */
+/* Live page title search: debounced as-you-type (min 2 chars), keyboard selectable
+ * results (ArrowUp/ArrowDown/Enter, Esc closes), loading / empty / error states.
+ * One result per page (title + language) with its counterpart pages as chips. */
 import { api } from "./api.js";
-import { $, $$, esc, debounce, LANGS } from "./util.js";
-import { openMerge } from "./router.js";
+import { $, $$, esc, debounce, sortByLang } from "./util.js";
+import { openPage } from "./router.js";
 
 const MIN_CHARS = 2;
-const QID_RE = /^Q\d+$/i;
 
 let seq = 0;          // ignore out-of-order responses
-let items = [];       // grouped results currently shown
+let items = [];       // page results currently shown
 let active = -1;      // highlighted option index
 let lastQuery = "";
 
@@ -38,17 +38,17 @@ function setActive(i) {
   }
 }
 
-/** Group per-language article rows into one result per Wikidata entity. */
-function group(rows) {
-  const byQid = new Map();
-  for (const r of rows) {
-    const key = r.wikidata_qid || `article-${r.id}`;
-    if (!byQid.has(key)) byQid.set(key, { qid: r.wikidata_qid, editions: [] });
-    byQid.get(key).editions.push(r);
-  }
-  const order = (l) => { const i = LANGS.indexOf(l); return i < 0 ? 99 : i; };
-  for (const g of byQid.values()) g.editions.sort((a, b) => order(a.lang) - order(b.lang));
-  return [...byQid.values()].filter((g) => g.qid);
+/** Normalise API rows ({page, counterparts, conflicts}) and drop pages without counterparts. */
+function normalise(rows) {
+  return (rows || [])
+    .filter((r) => r && r.page && (r.counterparts || []).length)
+    .map((r) => ({ ...r, counterparts: sortByLang(r.counterparts || []) }));
+}
+
+/** Counterpart chips, shared with the landing list. */
+export function counterpartChips(counterparts) {
+  return (counterparts || []).map((c) =>
+    `<span class="cp-chip"><span class="lang-tag">${esc(c.lang)}</span>${esc(c.title)}</span>`).join("");
 }
 
 function renderState(html) {
@@ -57,20 +57,21 @@ function renderState(html) {
   setOpen(true);
 }
 
-function renderResults(groups) {
-  items = groups;
-  if (!groups.length) {
-    renderState(`<p class="results-state muted">No tracked articles match “${esc(lastQuery)}”.
-      Only imported articles can be searched.</p>`);
+function renderResults(rows) {
+  items = rows;
+  if (!rows.length) {
+    renderState(`<p class="results-state muted">No pages match “${esc(lastQuery)}”.
+      Only imported pages that have a counterpart in another language can be compared.</p>`);
     return;
   }
-  list().innerHTML = groups.map((g, i) => {
-    const main = g.editions.find((e) => e.lang === "en") || g.editions[0];
-    const editions = g.editions.map((e) =>
-      `<span class="ed"><span class="lang-tag">${esc(e.lang)}</span>${esc(e.title)}</span>`).join("");
+  list().innerHTML = rows.map((r, i) => {
+    const n = Number(r.conflicts) || 0;
     return `<div class="result" role="option" id="result-${i}" data-index="${i}" aria-selected="false">
-        <span class="result-main"><b>${esc(main.title)}</b><span class="editions">${editions}</span></span>
-        <span class="muted qid">${esc(g.qid)}</span>
+        <span class="result-main">
+          <span><span class="lang-tag">${esc(r.page.lang)}</span><b>${esc(r.page.title)}</b></span>
+          <span class="counterparts"><span class="muted">vs.</span> ${counterpartChips(r.counterparts)}</span>
+        </span>
+        <span class="result-count ${n ? "has-conflicts" : ""}">${n ? `${esc(n)} conflict${n === 1 ? "" : "s"}` : "no conflicts"}</span>
       </div>`;
   }).join("");
   setOpen(true);
@@ -82,9 +83,9 @@ async function runSearch(q) {
   const my = ++seq;
   renderState(`<p class="results-state muted"><span class="spinner" aria-hidden="true"></span> Searching…</p>`);
   try {
-    const rows = await api.searchArticles(q);
+    const rows = await api.searchPages(q);
     if (my !== seq) return;
-    renderResults(group(rows || []));
+    renderResults(normalise(rows));
   } catch (err) {
     if (my !== seq) return;
     renderState(`<div class="results-state error-state" role="alert">
@@ -110,11 +111,11 @@ function onInput() {
 }
 
 function choose(i) {
-  const g = items[i];
-  if (!g) return;
+  const r = items[i];
+  if (!r) return;
   close();
   input().blur();
-  openMerge(g.qid);
+  openPage(r.page.lang, r.page.title);
 }
 
 export function close() { setOpen(false); }
@@ -150,7 +151,6 @@ export function init() {
     e.preventDefault();
     const q = inp.value.trim();
     if (active >= 0 && items[active]) return choose(active);
-    if (QID_RE.test(q)) { close(); inp.blur(); return openMerge(q.toUpperCase()); }
     if (items.length === 1) return choose(0);
     if (q.length >= MIN_CHARS) runSearch(q);
   });
