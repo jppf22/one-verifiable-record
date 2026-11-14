@@ -58,6 +58,8 @@
 
 /* ---------- filters ---------- */
 #filters { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 12px; }
+.default-view-note { margin: 0; padding: 4px 8px; font-size: 13px; border-left: 3px solid var(--bad); background: var(--bad-bg); }
+.default-view-note .link-btn { font-size: 13px; }
 .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
 .chip-group { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { padding: 3px 12px; border-radius: 999px; font-size: 13px; }
@@ -175,9 +177,10 @@
 .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .review-label { margin-right: 2px; }
 .review-btn { padding: 3px 10px; font-size: 13px; border-radius: 6px; }
-.review-btn.agree:hover:not(:disabled) { border-color: var(--ok); color: var(--ok); }
-.review-btn.disagree:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
-.review-btn.fix:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); }
+.review-btn.yes:hover:not(:disabled) { border-color: var(--ok); color: var(--ok); }
+.review-btn.no:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+.review-next { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+.review-next.decided { color: var(--ok); }
 .review.is-pending .review-actions { opacity: 0.6; }
 .review-stamp {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-bottom: 6px;
@@ -203,9 +206,42 @@
 }
 .decision-opt input { margin: 0; accent-color: var(--accent); }
 .decision-opt:has(input:checked) { border-color: var(--accent); background: var(--accent-quiet); }
-.decision-opt.agree:has(input:checked) { border-color: var(--ok); background: var(--ok-bg); }
-.decision-opt.disagree:has(input:checked) { border-color: var(--bad); background: var(--bad-bg); }
-.decision-opt.fix:has(input:checked) { border-color: var(--warn); background: var(--warn-bg); }
+.decision-opt.yes:has(input:checked) { border-color: var(--ok); background: var(--ok-bg); }
+.decision-opt.no:has(input:checked) { border-color: var(--bad); background: var(--bad-bg); }
+
+/* ---------- facts in only one language: compact rows ---------- */
+.row-card.is-gap { padding-bottom: 8px; }
+.row-card.is-gap > header { margin-bottom: 4px; }
+.gap-claims { display: flex; flex-direction: column; gap: 4px; }
+.gap-claims .claim { padding: 4px 8px; border: 0; border-left: 2px solid var(--border-subtle); background: transparent; }
+.gap-claims .claim p { margin-bottom: 2px; }
+.gap-claims .lang-tag { margin-right: 6px; }
+
+/* ---------- pairs checked but not the same fact (folded) ---------- */
+.other-links { margin-top: 8px; font-size: 13px; }
+.other-links > summary { cursor: pointer; color: var(--muted); width: fit-content; }
+.other-links > summary:hover { color: var(--text); }
+
+/* ---------- fix a confirmed conflict in every language (resolve.js) ---------- */
+.resolve { margin: 10px 0 8px; padding: 10px 12px; border: 1px solid var(--ok); border-left-width: 3px; background: #fff; }
+.resolve h4 { margin: 0 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--ok); }
+.resolve p { margin: 0 0 8px; font-size: 14px; }
+.resolve blockquote { margin: 0 0 6px; padding: 6px 10px; border-left: 3px solid var(--ok); background: var(--ok-bg); }
+.resolve-form { display: flex; flex-direction: column; gap: 6px; max-width: 720px; }
+.resolve-form textarea, .resolve-form input[type=url] { width: 100%; padding: 5px 8px; font: inherit; }
+.resolve-form textarea { resize: vertical; }
+.resolve-current { margin: 0 0 4px; padding: 0; list-style: none; display: grid; gap: 2px; font-size: 14px; }
+.resolve-current .lang-tag { margin-right: 6px; }
+.resolve-drafts { margin: 6px 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.resolve-draft { padding: 8px; border: 1px solid var(--border-subtle); background: var(--bg); }
+.resolve-draft.is-exported { border-color: var(--ok); }
+.resolve-draft-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+.resolve-pre { margin: 6px 0; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #fff; border: 1px solid var(--border-subtle); }
+.resolve-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.resolve-buttons button, .resolve-buttons .button-link { padding: 4px 10px; font-size: 13px; }
+.sg-chip.warn { background: var(--warn-bg); color: var(--warn); }
+.sg-chip.resolution { background: var(--ok-bg); color: var(--ok); }
+.warn-text { color: var(--warn); }
 
 /* ---------- review consensus (policy R1, display only) ---------- */
 .consensus-slot:empty { display: none; }
@@ -369,3 +405,4 @@
   #filter-text { flex: 1 1 100%; min-width: 0; }
   .compare-actions { padding-top: 0; }
 }
+.other-links .review-next { display: none; }

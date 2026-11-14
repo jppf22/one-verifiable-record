@@ -27,6 +27,9 @@ export function parse(hash = location.hash) {
     const title = decodeTitle(m[2]);
     if (LANG_RE.test(lang) && title) return { name: "page", lang, title, key: `${lang}:${title}`, query };
   }
+  if (path === "/review" || path.startsWith("/review/")) {
+    return { name: "review", query };
+  }
   return { name: "landing", query };
 }
 

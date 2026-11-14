@@ -39,11 +39,28 @@ export const api = {
     request(`/pages/${enc(pageId)}/recheck`, { method: "POST", body: { focus_link_ids: focusLinkIds } }),
   claimHistory: (claimId) => request(`/claims/${enc(claimId)}/history`),
   reviews: (linkId) => request(`/reviews?link_id=${enc(linkId)}`),
-  submitReview: ({ claim_link_id, reviewer, decision, note }) =>
-    request(`/reviews`, { method: "POST", body: { claim_link_id, reviewer, decision, note } }),
+  /** override: true lets the server apply policy R1 (a quorum writes a human verdict). */
+  submitReview: ({ claim_link_id, reviewer, decision, note, override = false }) =>
+    request(`/reviews`, { method: "POST", body: { claim_link_id, reviewer, decision, note, override } }),
+  linkConsensus: (linkId) => request(`/links/${enc(linkId)}/consensus`),
+  /** Latest correct version of a reviewer-confirmed conflict + its per-language drafts. */
+  resolution: (linkId) => request(`/links/${enc(linkId)}/resolution`),
+  /** {author, correct_text (English), source_url?} -> {resolution, drafts, skipped}. Export-only. */
+  createResolution: (linkId, body) => request(`/links/${enc(linkId)}/resolution`, { method: "POST", body }),
   suggestions: (pageId) => request(`/pages/${enc(pageId)}/suggestions`),
   exportSuggestion: (id) => request(`/suggestions/${enc(id)}/export`, { method: "POST" }),
   /** Grounded Q&A over this page and its counterpart pages. */
   qa: (pageId, q, lang) =>
     request(`/qa?page=${enc(pageId)}&q=${enc(q)}${lang ? `&lang=${enc(lang)}` : ""}`),
+  /** Reviewer dashboard: get paginated queue of claim links needing review. */
+  reviewQueue: (params = {}) => {
+    const p = new URLSearchParams();
+    if (params.limit !== undefined) p.set('limit', String(params.limit));
+    if (params.offset !== undefined) p.set('offset', String(params.offset));
+    if (params.status) p.set('status', params.status);
+    if (params.lang) p.set('lang', params.lang);
+    if (params.reviewer) p.set('reviewer', params.reviewer);
+    const qs = p.toString();
+    return request(`/review/queue${qs ? `?${qs}` : ''}`);
+  },
 };

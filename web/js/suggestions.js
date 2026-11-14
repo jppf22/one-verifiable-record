@@ -30,6 +30,13 @@ export function init() {
     state = { pageId, page, titles, drafts: [], loaded: false, loading: false, error: null, notes: {}, expanded: new Set() };
     render();
   });
+  // Drafts written from a resolution (resolve.js): show them here too, newest first.
+  on("suggestions:added", ({ pageId, drafts } = {}) => {
+    if (!state || state.pageId !== pageId || !state.loaded) return;
+    const have = new Set(state.drafts.map((d) => String(d.id)));
+    state.drafts = [...(drafts || []).filter((d) => !have.has(String(d.id))), ...state.drafts];
+    render();
+  });
 }
 
 /* ---------- rendering ---------- */
@@ -96,6 +103,7 @@ function card(d) {
       <header>
         <span class="sg-chip type">${esc(TYPE_LABEL[d.patch_type] || d.patch_type)}</span>
         <span class="sg-chip status-${esc(d.status || "draft")}">${esc(d.status || "draft")}</span>
+        ${d.resolution_id != null ? `<span class="sg-chip resolution" title="Written by a reviewer as the correct version of a confirmed conflict">reviewer fix</span>` : ""}
         ${d.claim_link_id != null ? `<span class="muted">link #${esc(d.claim_link_id)}</span>` : ""}
         <span class="muted sg-id">draft #${esc(d.id)}</span>
       </header>
@@ -116,7 +124,7 @@ function card(d) {
 }
 
 const rank = (order, v) => { const i = order.indexOf(v); return i < 0 ? order.length : i; };
-const titleFor = (d) => d.title || state.titles[d.lang] || "";
+const titleFor = (d) => d.title || state?.titles?.[d.lang] || "";
 
 /* Preloading text into an existing page is not possible in MediaWiki; only a new section
  * can be prefilled. en.wikipedia has Template:Preload_wikitext (body "$1") for that, so a
@@ -131,7 +139,7 @@ function splitHeading(text) {
   return m ? { heading: m[1], body: text.slice(m[0].length) } : { heading: "", body: text };
 }
 
-function editLink(d) {
+export function editLink(d) {
   const title = titleFor(d);
   if (!title || !/^[a-z-]{2,12}$/.test(d.lang || "")) return null;
   const base = `https://${d.lang}.wikipedia.org/w/index.php`;
@@ -143,8 +151,10 @@ function editLink(d) {
     if (tpl && body && body.length <= MAX_PRELOAD_CHARS) { q.set("preload", tpl); q.append("preloadparams[]", body); }
     return `${base}?${q}`;
   }
-  const q = new URLSearchParams({ title: title.replace(/ /g, "_"), action: "edit",
-    summary: `Cross-language consistency fix (One Verifiable Record draft #${d.id}); see talk page` });
+  const summary = d.resolution_id != null
+    ? `Correction checked against the other language editions, with a published source (One Verifiable Record draft #${d.id})`
+    : `Cross-language consistency fix (One Verifiable Record draft #${d.id}); see talk page`;
+  const q = new URLSearchParams({ title: title.replace(/ /g, "_"), action: "edit", summary });
   return `${base}?${q}`;
 }
 
@@ -257,7 +267,7 @@ function downloadAll() {
   download(`${`${p.lang || "page"}-${p.title || state.pageId}`.replace(/[^A-Za-z0-9_-]+/g, "_")}-patches.wiki`, header + parts.join("\n"));
 }
 
-async function copy(text) {
+export async function copy(text) {
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(text ?? "");

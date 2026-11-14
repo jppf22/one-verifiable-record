@@ -5,6 +5,8 @@ import * as search from "./search.js";
 import * as landing from "./landing.js";
 import * as merge from "./merge.js";
 import * as review from "./review.js";
+import * as reviewerDashboard from "./reviewer-dashboard.js";
+import * as resolve from "./resolve.js";
 import * as keyboard from "./keyboard.js";
 import * as history from "./history.js";
 import * as suggestions from "./suggestions.js";
@@ -35,15 +37,21 @@ function initReviewerChip() {
 
 function showRoute(route, prev) {
   const isPage = route.name === "page";
+  const isReview = route.name === "review";
   document.body.dataset.route = route.name;
-  $("#landing").hidden = isPage;
+  $("#landing").hidden = isPage || isReview;
   $("#compare-view").hidden = !isPage;
+  $("#review-dashboard").hidden = !isReview;
   search.close();
   if (isPage) {
     merge.open(route, route.query);
     if (prev?.key !== route.key) window.scrollTo(0, 0);
+  } else if (isReview) {
+    reviewerDashboard.show();
+    if (prev?.name !== "review") window.scrollTo(0, 0);
   } else {
     merge.close();
+    reviewerDashboard.hide();
     landing.load({ force: true });
     if (prev && prev.name !== "landing") $("#search-input").focus();
   }
@@ -59,6 +67,8 @@ safeInit("search", search);
 safeInit("landing", landing);
 safeInit("merge", merge);
 safeInit("review", review);
+safeInit("reviewerDashboard", reviewerDashboard);
+safeInit("resolve", resolve);
 safeInit("keyboard", keyboard);
 safeInit("history", history);
 safeInit("suggestions", suggestions);

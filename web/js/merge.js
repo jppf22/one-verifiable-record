@@ -11,6 +11,7 @@ import { on, emit } from "./bus.js";
 import { replaceQuery, pageHref } from "./router.js";
 import * as reviewUi from "./review.js";
 import * as consensus from "./consensus.js";
+import * as resolve from "./resolve.js";
 
 export const STATUS = {
   conflict: { label: "Conflict", plural: "conflicts", one: "conflict" },
@@ -33,14 +34,19 @@ const VERDICT_CLASS = {
   contradicted: "bad", possible_conflict: "warn", possible_match: "warn",
   supported: "ok", definition_mismatch: "warn", unverifiable: "warn",
 };
-const SOURCE_LABEL = { "deterministic-fallback": "rules (LLM unavailable)" };
+const SOURCE_LABEL = { "deterministic-fallback": "rules (LLM unavailable)", human: "human consensus" };
 const sourceLabel = (s) => SOURCE_LABEL[s] || s || "unknown";
 const fmtNum = (x, d = 2) => (x != null && x !== "" && !isNaN(Number(x)) ? Number(x).toFixed(d) : null);
 const GAP_STATUSES = new Set(["missing_here", "only_here"]);
 const SIM_TOOLTIP = "Similarity = 1 − cosine distance via MariaDB VEC_DISTANCE_COSINE over an HNSW index";
 const RECHECK_KEY = (pageId) => `ovr.recheck.page.${pageId}`;
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
-const emptyFilters = () => ({ statuses: new Set(), kinds: new Set(), text: "", unreviewed: false });
+// showGaps: null = automatic (shown when a page has few one-language facts)
+const emptyFilters = () => ({ statuses: new Set(), kinds: new Set(), text: "", unreviewed: false, showGaps: null,
+  defaulted: false, wantDefault: false });
+// Default view on pages with conflicts: only the conflicts (?status=all shows everything).
+const DEFAULT_STATUSES = ["conflict", "possible_conflict"];
+const AUTO_GAP_LIMIT = 12;
 
 const state = {
   routeKey: null,       // "lang:title" of the current route
@@ -51,6 +57,7 @@ const state = {
   filters: emptyFilters(),
   focusedKey: null,
   openDrawers: new Set(),
+  openOthers: new Set(),  // row keys whose "more pairs checked" list is open
   linkIndex: new Map(),   // link id -> {link, row}
   claimIndex: new Map(),  // claim id -> claim
   rechecking: false,
@@ -86,17 +93,42 @@ function rowClaims(r) {
 /** Links that carry a verdict (ungraded "unmatched" candidates are hidden). */
 function gradedLinks(r) { return (r.links || []).filter((l) => l.verdict && l.verdict !== "unmatched"); }
 
+/* A "main" link says the two claims are the same fact (or plausibly so) and is what a
+ * reviewer acts on. The rest (unrelated pairs the grader checked, guesses made while
+ * the LLM was unavailable) stay available as receipts but are folded away. Same rule
+ * as server/diff.py connects(). */
+const STRONG = new Set(["supported", "contradicted"]);
+const WEAK = new Set(["possible_match", "possible_conflict"]);
+function isMain(l) {
+  if (STRONG.has(l.verdict)) return true;
+  if (l.verdict_source === "deterministic-fallback") return false;
+  // unverifiable connects only when the same-fact gate confirmed the pair (gate.py)
+  return WEAK.has(l.verdict) || (l.verdict === "unverifiable" && l.relation === "same");
+}
+function mainLinks(r) { return gradedLinks(r).filter(isMain); }
+function otherLinks(r) { return gradedLinks(r).filter((l) => !isMain(l)); }
+
+function gapCount(data) { return (data?.rows || []).filter((r) => GAP_STATUSES.has(r.status)).length; }
+function showGaps() {
+  const f = state.filters.showGaps;
+  return f ?? gapCount(state.data) <= AUTO_GAP_LIMIT;
+}
+
 function computeSummary(data) {
   const s = { conflict: 0, possible_conflict: 0, missing_here: 0, only_here: 0,
     possible_match: 0, agree: 0, links_total: 0, links_reviewed: 0 };
   for (const r of data.rows || []) {
     if (r.status in s) s[r.status]++;
-    for (const l of gradedLinks(r)) { s.links_total++; if (l.review) s.links_reviewed++; }
+    for (const l of mainLinks(r)) { s.links_total++; if (l.review) s.links_reviewed++; }
   }
   return s;
 }
 
-function summaryOf(data) { return { ...computeSummary(data), ...(data.summary || {}) }; }
+/** Server status counts; review progress counts only the main links (what a reviewer acts on). */
+function summaryOf(data) {
+  const mine = computeSummary(data);
+  return { ...mine, ...(data.summary || {}), links_total: mine.links_total, links_reviewed: mine.links_reviewed };
+}
 
 function indexData(data) {
   state.linkIndex.clear();
@@ -188,7 +220,7 @@ function rowByKey(key) { return (state.data?.rows || []).find((r) => r.key === k
 /** Toggle the receipts of the focused row's first unreviewed (else first) verdict. */
 export function toggleFocusedReceipts() {
   const r = focusedRow();
-  const link = r && (firstUnreviewedLink(r) || gradedLinks(r)[0]);
+  const link = r && (firstUnreviewedLink(r) || mainLinks(r)[0]);
   if (link) toggleDrawer(link.id);
   return Boolean(link);
 }
@@ -203,7 +235,7 @@ export function focusedRow() {
 export function firstClaim(row) { return rowClaims(row)[0] || null; }
 
 export function firstUnreviewedLink(row) {
-  return gradedLinks(row).find((l) => !l.review) || null;
+  return mainLinks(row).find((l) => !l.review) || null;
 }
 
 export function isActive() { return Boolean(state.routeKey) && !$("#compare-view").hidden; }
@@ -286,18 +318,21 @@ async function fetchCompare({ quiet = false } = {}) {
 /** Open (or re-filter) the comparison view for a route {lang, title, key}. */
 export async function open(route, query = new URLSearchParams()) {
   applyQueryFilters(query);
-  if (route.key === state.routeKey && state.data) { renderAll(); applyQueryFocus(query); return; }
+  if (route.key === state.routeKey && state.data) { applyDefaultView(state.data); renderAll(); applyQueryFocus(query); return; }
   state.routeKey = route.key;
   state.route = route;
   state.pageId = null;
   state.data = null;
   state.focusedKey = null;
   state.openDrawers.clear();
+  state.openOthers.clear();
+  state.filters.showGaps = null;
   hideBanner();
   document.title = `${route.title} (${route.lang}) · One Verifiable Record`;
   const key = route.key;
   const data = await fetchCompare();
   if (!data || key !== state.routeKey) return;
+  applyDefaultView(data);
   renderAll();
   applyQueryFocus(query);
   emit("page:loaded", { pageId: state.pageId, data });
@@ -326,12 +361,26 @@ export function close() {
 /* ---------------- filters ---------------- */
 
 function applyQueryFilters(query) {
-  const statuses = (query.get("status") || "").split(",").filter((s) => s in STATUS);
+  const raw = query.get("status") || "";
+  const statuses = raw.split(",").filter((s) => s in STATUS);
   state.filters.statuses = new Set(statuses);
+  state.filters.defaulted = false;
+  state.filters.wantDefault = !raw; // no choice in the URL: conflicts-only if there are any
+}
+
+/** Conflicts-only default, applied once per open when the URL names no status. */
+function applyDefaultView(data) {
+  if (!state.filters.wantDefault) return;
+  state.filters.wantDefault = false;
+  if (!(data?.rows || []).some((r) => DEFAULT_STATUSES.includes(r.status))) return;
+  state.filters.statuses = new Set(DEFAULT_STATUSES);
+  state.filters.defaulted = true;
 }
 
 function persistFilters() {
-  replaceQuery({ status: STATUS_ORDER.filter((s) => state.filters.statuses.has(s)) });
+  const chosen = STATUS_ORDER.filter((s) => state.filters.statuses.has(s));
+  // An explicit "everything" is written as status=all so the default doesn't come back.
+  replaceQuery({ status: chosen.length ? chosen : "all" });
 }
 
 function rowKinds(r) {
@@ -341,6 +390,7 @@ function rowKinds(r) {
 function passes(r) {
   const f = state.filters;
   if (f.statuses.size && !f.statuses.has(r.status)) return false;
+  if (GAP_STATUSES.has(r.status) && !f.statuses.has(r.status) && !showGaps()) return false;
   if (f.kinds.size && !rowKinds(r).some((k) => f.kinds.has(k))) return false;
   if (f.unreviewed && !firstUnreviewedLink(r)) return false;
   if (f.text.trim() && !haystack(r).includes(f.text.trim().toLowerCase())) return false;
@@ -361,11 +411,12 @@ function haystack(r) {
 
 function filtersActive() {
   const f = state.filters;
-  return f.statuses.size || f.kinds.size || f.text.trim() || f.unreviewed;
+  return f.statuses.size || f.kinds.size || f.text.trim() || f.unreviewed || f.showGaps != null;
 }
 
 function toggleStatus(s) {
   const set = state.filters.statuses;
+  if (state.filters.defaulted) { set.clear(); state.filters.defaulted = false; } // first click picks one status
   set.has(s) ? set.delete(s) : set.add(s);
   persistFilters();
   refilter();
@@ -456,6 +507,7 @@ function renderSummary() {
       <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${s.links_total}"
         aria-valuenow="${s.links_reviewed}" aria-label="Review progress"><div style="width:${reviewedPct}%"></div></div>
       <span class="muted"><b>${s.links_reviewed}</b> / ${s.links_total} verdicts reviewed</span>
+      ${s.links_hidden ? `<span class="muted" title="Vector search proposed these pairs, but they are not about the same fact (for example a birth date next to a death date), or were never graded. They are kept in the database and not shown.">· ${s.links_hidden} candidate pairs ruled out</span>` : ""}
     </div>`;
 }
 
@@ -479,9 +531,14 @@ function renderFilters() {
     <div class="filter-row">
       <input id="filter-text" type="search" placeholder="Filter statements, values, predicates…" value="${esc(f.text)}" aria-label="Filter by statement text">
       <label class="toggle"><input type="checkbox" id="filter-unreviewed" ${f.unreviewed ? "checked" : ""}> Only unreviewed</label>
+      ${gapCount(d) ? `<label class="toggle" title="Facts that only one language edition states (missing here / only here)">
+        <input type="checkbox" id="filter-gaps" ${showGaps() ? "checked" : ""}> Show facts found in only one language (${gapCount(d)})</label>` : ""}
       <span class="muted filter-count" role="status">Showing ${shown} of ${(d.rows || []).length} rows</span>
       <button type="button" class="link-btn" data-action="clear-filters" ${filtersActive() ? "" : "hidden"}>Clear filters</button>
-    </div>`;
+    </div>
+    <p class="default-view-note" ${f.defaulted ? "" : "hidden"}>Showing <b>conflicts only</b>: facts the
+      language editions state differently. <button type="button" class="link-btn" data-action="show-all">Show all
+      ${(d.rows || []).length} rows</button></p>`;
   if (hadFocus) { const inp = $("#filter-text"); inp.focus(); inp.setSelectionRange(caret, caret); }
 }
 
@@ -492,13 +549,17 @@ function syncFilterUi() {
   for (const c of $$("#filters [data-kind]")) c.setAttribute("aria-pressed", String(f.kinds.has(c.dataset.kind)));
   const clear = $("#filters [data-action=clear-filters]");
   if (clear) clear.hidden = !filtersActive();
+  const note = $("#filters .default-view-note");
+  if (note) note.hidden = !f.defaulted;
   const box = $("#filter-text");
   if (box && box.value !== f.text) box.value = f.text;
   const un = $("#filter-unreviewed");
   if (un) un.checked = f.unreviewed;
+  const gaps = $("#filter-gaps");
+  if (gaps) gaps.checked = showGaps();
 }
 
-function claimCell(cl) {
+function claimCell(cl, { showLang = false } = {}) {
   const url = claimUrl(cl);
   const rev = cl.revision_id
     ? (url ? `<a href="${esc(url)}" target="_blank" rel="noopener" class="receipt-link"
@@ -506,7 +567,7 @@ function claimCell(cl) {
            : `<span>rev ${esc(cl.revision_id)}</span>`)
     : `<span class="muted">rev unknown</span>`;
   return `<div class="claim" data-claim-id="${esc(cl.id)}">
-      ${cl.value_text ? `<p class="value"><span class="muted">${esc(humanise(cl.predicate) || "value")}:</span> <b>${esc(cl.value_text)}</b></p>` : ""}
+      ${cl.value_text ? `<p class="value">${showLang ? `<span class="lang-tag">${esc(cl.lang)}</span>` : ""}<span class="muted">${esc(humanise(cl.predicate) || "value")}:</span> <b>${esc(cl.value_text)}</b></p>` : ""}
       <p class="statement" lang="${esc(cl.lang)}">${esc(cl.statement_text)}</p>
       <div class="claim-meta">
         <span class="kind-tag">${esc(humanise(cl.kind || "claim"))}</span>
@@ -645,17 +706,42 @@ function verdictRow(link) {
       ${link.rationale ? `<p class="rationale">${esc(link.rationale)}</p>` : ""}
       <div class="receipts-drawer" id="${drawerId}" ${open ? "" : "hidden"}>${open ? evidenceHtml(link) : ""}</div>
       ${reviewUi.controlsHtml(link)}
+      ${resolve.html(link, resolveContext(link))}
     </div>`;
 }
 
+/** Claims of the link's two sides, for the resolution form ("currently says…"). */
+function resolveContext(link) {
+  const a = state.claimIndex.get(Number(link.claim_a));
+  const b = state.claimIndex.get(Number(link.claim_b));
+  const langs = sortByLang([thisPage(), ...(state.data?.counterparts || [])].filter(Boolean));
+  return { claims: sortByLang([a, b].filter(Boolean)), langs: langs.map((p) => p.lang) };
+}
+
+/** Gap rows (one language only) are shown as a compact list, not a multi-column diff. */
+function gapBody(r) {
+  return `<div class="gap-claims">${rowClaims(r).map((cl) => claimCell(cl, { showLang: true })).join("")}</div>`;
+}
+
+function otherLinksHtml(r) {
+  const others = otherLinks(r);
+  if (!others.length) return "";
+  const open = state.openOthers.has(r.key);
+  return `<details class="other-links" data-others-for="${esc(r.key)}" ${open ? "open" : ""}>
+      <summary>${others.length} more pair${others.length === 1 ? "" : "s"} checked: not the same fact, or not graded yet</summary>
+      <div class="verdicts">${open ? others.map(verdictRow).join("") : ""}</div>
+    </details>`;
+}
+
 function rowCard(r, cpLangs) {
-  const links = gradedLinks(r);
+  const links = mainLinks(r);
   const reviewed = links.filter((l) => l.review).length;
+  const gap = GAP_STATUSES.has(r.status);
   const kinds = [...new Set(rowKinds(r))];
   const predicate = r.predicate || rowClaims(r).find((cl) => cl.predicate)?.predicate;
   const label = STATUS[r.status]?.label || r.status;
   const note = rowNote(r, cpLangs);
-  return `<article class="row-card ${esc(r.status)}${r.key === state.focusedKey ? " is-focused" : ""}"
+  return `<article class="row-card ${esc(r.status)}${gap ? " is-gap" : ""}${r.key === state.focusedKey ? " is-focused" : ""}"
       data-key="${esc(r.key)}" tabindex="-1" aria-label="${esc(label)} row${predicate ? `: ${esc(humanise(predicate))}` : ""}">
       <header>
         <span class="badge ${esc(r.status)}">${esc(label)}</span>
@@ -664,8 +750,9 @@ function rowCard(r, cpLangs) {
         ${note ? `<span class="muted row-note">${note}</span>` : ""}
         ${links.length ? `<span class="muted row-progress">${reviewed} / ${links.length} reviewed</span>` : ""}
       </header>
-      <div class="diff" style="--cps:${cpLangs.length}">${diffHtml(r, cpLangs)}</div>
+      ${gap ? gapBody(r) : `<div class="diff" style="--cps:${cpLangs.length}">${diffHtml(r, cpLangs)}</div>`}
       ${links.length ? `<div class="verdicts">${links.map(verdictRow).join("")}</div>` : ""}
+      ${otherLinksHtml(r)}
     </article>`;
 }
 
@@ -871,6 +958,8 @@ function resetFilters() {
 
 export function init() {
   reviewUi.bind({ getLink, getPageId: () => state.pageId });
+  resolve.bind({ getLink, getPageId: () => state.pageId,
+    contextFor: (link) => resolveContext(link) });
 
   on("recheck:done", onRecheckDone);
   on("page:reload", ({ pageId } = {}) => { if (pageId == null || Number(pageId) === Number(state.pageId)) reload(); });
@@ -882,7 +971,7 @@ export function init() {
     if (action === "retry") { const r = state.route; state.routeKey = null; open(r); return; }
     if (action === "recheck") { recheckNow(); return; }
     if (action === "dismiss-banner") { hideBanner(); sessionStorage.removeItem(RECHECK_KEY(state.pageId)); return; }
-    if (action === "clear-filters") { resetFilters(); refilter(); return; }
+    if (action === "clear-filters" || action === "show-all") { resetFilters(); refilter(); return; }
     const status = t.closest("[data-status]")?.dataset.status;
     if (status && t.closest("#summary-bar, #filters")) { toggleStatus(status); return; }
     const kind = t.closest("[data-kind]")?.dataset.kind;
@@ -908,6 +997,21 @@ export function init() {
     if (card && !t.closest("a, button, input, textarea, label, form")) focusRow(card.dataset.key, { scroll: false });
   });
 
+  // "N more pairs checked" lists render on first open (a page can have hundreds).
+  view.addEventListener("toggle", (e) => {
+    const det = e.target;
+    if (!det.matches?.("details.other-links")) return;
+    const key = det.dataset.othersFor;
+    if (!det.open) { state.openOthers.delete(key); return; }
+    state.openOthers.add(key);
+    const r = rowByKey(key);
+    const host = det.querySelector(".verdicts");
+    if (r && host && !host.childElementCount) {
+      host.innerHTML = otherLinks(r).map(verdictRow).join("");
+      consensus.hydrate(host, getLink);
+    }
+  }, true);
+
   // Debounced: the filter bar is not rebuilt, so focus and caret stay in the text box.
   const onText = debounce(() => { syncFilterUi(); applyVisibility(); }, 150);
   view.addEventListener("input", (e) => {
@@ -916,6 +1020,10 @@ export function init() {
   view.addEventListener("change", (e) => {
     if (e.target.id === "filter-unreviewed") {
       state.filters.unreviewed = e.target.checked;
+      refilter();
+    }
+    if (e.target.id === "filter-gaps") {
+      state.filters.showGaps = e.target.checked;
       refilter();
     }
   });
