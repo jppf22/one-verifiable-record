@@ -103,6 +103,7 @@ CREATE TABLE claims (
   citation_urls    JSON NULL COMMENT 'citation URLs or identifiers found with the claim',
   extraction_confidence FLOAT NULL,
   data_quality_score FLOAT NULL COMMENT '0-1 quality score based on validation (structure, completeness, consistency)',
+  salience_score   FLOAT NULL COMMENT '0-1 ML second-sweep salience and cross-edition relevance score',
   revision_id      BIGINT UNSIGNED NULL,
   model_version    VARCHAR(64) NULL COMMENT 'extractor model that produced this claim',
   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -146,7 +147,7 @@ CREATE TABLE claim_links (
   candidate_confidence FLOAT NULL COMMENT 'semantic matcher confidence; similarity alone is not a verdict',
   verdict_confidence FLOAT NULL COMMENT 'combined confidence: similarity + predicate match + layer certainty',
   verdict        ENUM('supported','contradicted','possible_match','possible_conflict',
-                      'unverifiable','definition_mismatch','unmatched') NOT NULL,
+                      'unverifiable','definition_mismatch','unmatched','different_fact') NOT NULL,
   verdict_source ENUM('deterministic','llm','human','deterministic-fallback') NOT NULL,
   evidence       TEXT NULL COMMENT 'receipts: source passages',
   rationale      TEXT NULL,
@@ -183,12 +184,32 @@ CREATE TABLE suggestions (
   id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   article_id    BIGINT UNSIGNED NOT NULL COMMENT 'target article the patch is proposed for',
   claim_link_id BIGINT UNSIGNED NULL,
+  resolution_id BIGINT UNSIGNED NULL COMMENT 'resolution this draft was generated from',
   patch_type    ENUM('wikitext','talk_page','citation') NOT NULL,
   wikitext      MEDIUMTEXT NOT NULL,
   status        ENUM('draft','exported','applied') NOT NULL DEFAULT 'draft',
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_article (article_id),
+  KEY idx_sugg_resolution (resolution_id),
   CONSTRAINT fk_sugg_article FOREIGN KEY (article_id) REFERENCES articles (id)
+) ENGINE=InnoDB
+WITH SYSTEM VERSIONING;
+
+-- ----------------------------------------------------------------------------
+-- resolutions: the correct version of a reviewer-confirmed conflict (verdict
+-- 'contradicted', source 'human'), written in English. The server turns it into
+-- one draft per page of the comparison set (suggestions.resolution_id). Versioned,
+-- so every rewrite of the correct text is kept. Migration 004.
+-- ----------------------------------------------------------------------------
+CREATE TABLE resolutions (
+  id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  claim_link_id BIGINT UNSIGNED NOT NULL,
+  author        VARCHAR(128) NOT NULL,
+  correct_text  TEXT NOT NULL COMMENT 'the correct version, written in English',
+  source_url    VARCHAR(2048) NULL COMMENT 'reliable non-Wikipedia source (WP:CIRCULAR)',
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_res_link (claim_link_id),
+  CONSTRAINT fk_res_link FOREIGN KEY (claim_link_id) REFERENCES claim_links (id)
 ) ENGINE=InnoDB
 WITH SYSTEM VERSIONING;
 
