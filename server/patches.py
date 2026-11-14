@@ -4,7 +4,7 @@ Policy: cross-wiki automated editing is prohibited by Wikipedia policy, so we
 never apply anything. We generate exportable wikitext drafts (article text
 suggestions, citation templates, talk-page summaries) for human editors.
 """
-from db import execute, query
+from db import execute, query, query_one
 from diff import build_merge_view
 
 
@@ -46,6 +46,18 @@ def talk_page_draft(qid: str, conflict_count: int, gap_count: int) -> str:
 
 
 def _insert(article_id: int, link_id, patch_type: str, wikitext: str) -> bool:
+    """Insert a draft unless an identical one already exists for this article.
+
+    Returns True when a new row was created.
+    """
+    exists = query_one(
+        """SELECT id FROM suggestions
+           WHERE article_id = %s AND patch_type = %s AND wikitext = %s
+           LIMIT 1""",
+        (article_id, patch_type, wikitext),
+    )
+    if exists:
+        return False
     execute(
         """INSERT INTO suggestions (article_id, claim_link_id, patch_type, wikitext)
            VALUES (%s, %s, %s, %s)""",
@@ -75,8 +87,9 @@ def generate_suggestions(qid: str) -> dict:
                 art = articles_by_lang.get(target["lang"])
                 if not art:
                     continue
-                _insert(art["id"], None, "wikitext", conflict_patch(source, target))
-                created += 1
+                created += _insert(
+                    art["id"], link["id"], "wikitext", conflict_patch(source, target)
+                )
 
     # one gap notice per (gap claim, language missing it)
     for cluster in gaps:
@@ -84,17 +97,18 @@ def generate_suggestions(qid: str) -> dict:
             for art in view["articles"]:
                 if art["lang"] in cluster["langs_present"]:
                     continue
-                _insert(art["id"], None, "wikitext", gap_patch(source, art["lang"]))
-                created += 1
+                created += _insert(
+                    art["id"], None, "wikitext", gap_patch(source, art["lang"])
+                )
 
     # one talk-page draft per language edition
     for art in view["articles"]:
-        _insert(art["id"], None, "talk_page",
-                talk_page_draft(qid, len(conflicts), len(gaps)))
-        created += 1
+        created += _insert(art["id"], None, "talk_page",
+                           talk_page_draft(qid, len(conflicts), len(gaps)))
 
     drafts = query(
-        """SELECT s.id, s.patch_type, s.wikitext, s.status, a.lang, a.title
+        """SELECT s.id, s.patch_type, s.wikitext, s.status, a.lang, a.title,
+                  s.claim_link_id
            FROM suggestions s
            JOIN articles a ON a.id = s.article_id
            WHERE a.wikidata_qid = %s
@@ -102,3 +116,22 @@ def generate_suggestions(qid: str) -> dict:
         (qid,),
     )
     return {"qid": qid, "created": created, "drafts": drafts}
+
+
+def get_suggestion(suggestion_id: int):
+    return query_one(
+        """SELECT s.id, s.status, s.claim_link_id, a.wikidata_qid
+           FROM suggestions s
+           JOIN articles a ON a.id = s.article_id
+           WHERE s.id = %s""",
+        (suggestion_id,),
+    )
+
+
+def mark_exported(suggestion_id: int) -> int:
+    """draft -> exported. A system-versioned UPDATE, so the export itself is
+    part of the audit trail. Already exported/applied drafts are left alone."""
+    return execute(
+        "UPDATE suggestions SET status = 'exported' WHERE id = %s AND status = 'draft'",
+        (suggestion_id,),
+    )

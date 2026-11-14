@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/css/merge.css">
   <link rel="stylesheet" href="/css/panels.css">
 </head>
-<body>
+<body data-route="picker">
   <header id="app-header">
     <div class="brand">
       <a href="#/" class="home-link"><h1>One Verifiable Record</h1></a>
@@ -16,16 +16,25 @@
     </div>
     <div id="reviewer-slot"></div>
     <form id="search-form" role="search">
-      <input id="search-input" placeholder="Search an article tracked across fi / sv / en…" autocomplete="off" aria-label="Search articles">
+      <div class="search-box">
+        <input id="search-input" placeholder="Search an article tracked across fi / sv / en… (press /)" autocomplete="off" spellcheck="false" aria-label="Search articles">
+        <div id="results" class="results" role="listbox" aria-label="Matching articles" hidden></div>
+      </div>
       <button type="submit">Open merge view</button>
     </form>
   </header>
 
-  <main>
+  <main id="main">
     <section id="article-picker">
       <p class="muted">Search for an article to see how the Finnish, Swedish and English
       editions agree, conflict, or leave gaps in each other.</p>
-      <div id="results" class="results" role="listbox"></div>
+      <ul class="legend">
+        <li><span class="badge conflict">Conflict</span> the editions contradict each other</li>
+        <li><span class="badge gap">Gap</span> one edition has a fact the others lack</li>
+        <li><span class="badge agree">Agree</span> every edition says the same thing</li>
+      </ul>
+      <p class="muted">Every verdict carries receipts: the source passage, the revision id and a
+      link back to Wikipedia. Press <kbd>?</kbd> for keyboard shortcuts.</p>
     </section>
 
     <section id="merge-view" hidden>

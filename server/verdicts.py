@@ -11,7 +11,7 @@ import json
 import httpx
 
 from config import settings
-from db import execute, query
+from db import execute, placeholders, query
 
 NUMERIC_TOLERANCE = 1e-9
 
@@ -87,45 +87,90 @@ def llm_verdict(a: dict, b: dict):
         return "unverifiable", f"LLM error: {exc}"
 
 
+PAIR_SELECT = """
+SELECT cl.id AS link_id, cl.verdict AS verdict, cl.verdict_source AS verdict_source,
+       ca.id AS a_id, ca.kind AS a_kind, ca.statement_text AS a_text,
+       ca.value_normalized AS a_value, aa.lang AS a_lang,
+       cb.id AS b_id, cb.kind AS b_kind, cb.statement_text AS b_text,
+       cb.value_normalized AS b_value, ab.lang AS b_lang
+FROM claim_links cl
+JOIN claims ca ON ca.id = cl.claim_a
+JOIN articles aa ON aa.id = ca.article_id
+JOIN claims cb ON cb.id = cl.claim_b
+JOIN articles ab ON ab.id = cb.article_id
+"""
+
+
+def _side(p: dict, prefix: str) -> dict:
+    return {
+        "id": p[f"{prefix}_id"], "kind": p[f"{prefix}_kind"],
+        "statement_text": p[f"{prefix}_text"],
+        "value_normalized": p[f"{prefix}_value"], "lang": p[f"{prefix}_lang"],
+    }
+
+
+def fetch_pairs(where: str, params=()) -> list:
+    """Links (with both claims) matching a WHERE clause over PAIR_SELECT aliases."""
+    return query(PAIR_SELECT + " WHERE " + where + " ORDER BY cl.id", params)
+
+
+def fetch_pairs_by_ids(link_ids) -> list:
+    link_ids = list(link_ids)
+    if not link_ids:
+        return []
+    return fetch_pairs(f"cl.id IN ({placeholders(link_ids)})", tuple(link_ids))
+
+
+def grade_pair(a: dict, b: dict):
+    """Grade one claim pair, cheapest layer first -> (verdict, source, rationale)."""
+    det = deterministic_verdict(a, b)
+    if det:
+        return det, "deterministic", "canonical value comparison"
+    verdict, rationale = llm_verdict(a, b)
+    return verdict, "llm", rationale
+
+
+def grade_links(pairs, touch_ids=()) -> list:
+    """(Re)grade the given links. claim_links is only UPDATEd when the verdict
+    changes, so no no-op system-versioned history rows are written, except for
+    ``touch_ids``: links regraded because a claim changed get ``computed_at``
+    bumped even when the verdict holds. That records "re-verified against the new
+    claim version" in the link's history and stops them looking stale forever.
+
+    Returns [{id, before, after, changed}].
+    """
+    results = []
+    for p in pairs:
+        a, b = _side(p, "a"), _side(p, "b")
+        verdict, source, rationale = grade_pair(a, b)
+        changed = verdict != p["verdict"]
+        if changed or p["link_id"] in touch_ids:
+            # receipts: both statements, so every verdict can be checked against sources
+            execute(
+                """UPDATE claim_links
+                   SET verdict = %s, verdict_source = %s, rationale = %s,
+                       evidence = CONCAT(%s, ' || ', %s),
+                       computed_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (verdict, source, rationale, a["statement_text"], b["statement_text"],
+                 p["link_id"]),
+            )
+        results.append(
+            {"id": p["link_id"], "before": p["verdict"], "after": verdict, "changed": changed}
+        )
+    return results
+
+
+def grade_unmatched(qid: str) -> list:
+    """Grade every 'unmatched' link of this entity. Returns grade_links() results."""
+    return grade_links(
+        fetch_pairs("aa.wikidata_qid = %s AND cl.verdict = 'unmatched'", (qid,))
+    )
+
+
 def run_verdicts(qid: str) -> dict:
     """Grade every 'unmatched' link of this entity and return verdict counts."""
-    pairs = query(
-        """SELECT cl.id AS link_id,
-                  ca.id AS a_id, ca.kind AS a_kind, ca.statement_text AS a_text,
-                  ca.value_normalized AS a_value, aa.lang AS a_lang,
-                  cb.id AS b_id, cb.kind AS b_kind, cb.statement_text AS b_text,
-                  cb.value_normalized AS b_value, ab.lang AS b_lang
-           FROM claim_links cl
-           JOIN claims ca ON ca.id = cl.claim_a
-           JOIN articles aa ON aa.id = ca.article_id
-           JOIN claims cb ON cb.id = cl.claim_b
-           JOIN articles ab ON ab.id = cb.article_id
-           WHERE aa.wikidata_qid = %s AND cl.verdict = 'unmatched'""",
-        (qid,),
-    )
     counts: dict = {}
-    for p in pairs:
-        a = {
-            "id": p["a_id"], "kind": p["a_kind"], "statement_text": p["a_text"],
-            "value_normalized": p["a_value"], "lang": p["a_lang"],
-        }
-        b = {
-            "id": p["b_id"], "kind": p["b_kind"], "statement_text": p["b_text"],
-            "value_normalized": p["b_value"], "lang": p["b_lang"],
-        }
-        det = deterministic_verdict(a, b)
-        if det:
-            verdict, source, rationale = det, "deterministic", "canonical value comparison"
-        else:
-            verdict, rationale = llm_verdict(a, b)
-            source = "llm"
-        # receipts: both statements, so every verdict can be checked against sources
-        execute(
-            """UPDATE claim_links
-               SET verdict = %s, verdict_source = %s, rationale = %s,
-                   evidence = CONCAT(%s, ' || ', %s)
-               WHERE id = %s""",
-            (verdict, source, rationale, a["statement_text"], b["statement_text"], p["link_id"]),
-        )
-        counts[verdict] = counts.get(verdict, 0) + 1
+    for r in grade_unmatched(qid):
+        counts[r["after"]] = counts.get(r["after"], 0) + 1
     return counts

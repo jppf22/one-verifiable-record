@@ -61,7 +61,8 @@ Response `RecheckResult`:
   **no newer system-versioned row since the link's `computed_at`** keep their verdict and
   skip the LLM (`regraded: false`). Focus links are always regraded.
 * The server only writes `UPDATE claim_links` when the verdict changes, so no-op
-  history rows aren't created.
+  history rows aren't created. Exception: stale links (claim changed) always get
+  `computed_at` bumped (assumption A6).
 
 ### `GET /api/suggestions/{qid}` (extended)
 Drafts gain `claim_link_id` (nullable) and `status`. Repeated calls must **not**
@@ -100,7 +101,7 @@ Adds `"gaps": n` (gap clusters) and `"conflicts": n` (conflict clusters) next to
 | --- | --- | --- | --- |
 | `article:loaded` | `{qid, data}` (merge payload) | merge.js | panels (Q&A, suggestions reset) |
 | `history:open` | `{claimId}` | merge.js / keyboard.js | history.js |
-| `recheck:done` | `{qid, result, reason: "review"|"export"|"manual"}` | review.js / suggestions.js | merge.js (re-render + banner) |
+| `recheck:done` | `{qid, result, reason: "review"|"export"|"manual", linkIds?}` | review.js / suggestions.js | merge.js (re-render + banner) |
 | `merge:reload` | `{qid}` | anyone | merge.js |
 
 Panels expose `init()` in each module. `main.js` imports and calls them.
@@ -112,3 +113,8 @@ Panels expose `init()` in each module. `main.js` imports and calls them.
 
 ## Contract change requests
 (append here)
+- (server) RecheckResult `links[].before` can be `null` for a link that the re-check's
+  own alignment step just created (it had no verdict before). Treat `null` as "new link".
+  Every entry in `links` has `regraded: true`. See assumptions S4.
+- (web-core) `recheck:done` may carry `linkIds` (the reviewed link). If a review response has
+  no `recheck`, review.js emits `merge:reload` instead. See W4.

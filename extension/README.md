@@ -1,8 +1,10 @@
 # One Verifiable Record — browser extension
 
 Manifest V3 Chrome extension. Adds a consistency badge under the heading of any
-Wikipedia article that the backend tracks: how many cross-language conflicts and
-verified claims the fi/sv/en editions have, with a deep link into the merge view.
+Wikipedia article that the backend tracks: how many cross-language conflicts, gaps
+(facts missing from some editions) and verified claims the fi/sv/en editions have,
+with a deep link into the merge view (`#/merge/{QID}`). The pill is red when there
+are conflicts, amber when there are only gaps, green otherwise.
 
 ## Install (development mode)
 

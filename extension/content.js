@@ -31,19 +31,38 @@
   if (!heading) return;
 
   const counts = data.counts || {};
-  const conflicts = counts.contradicted || 0;
-  const supported = counts.supported || 0;
+  const num = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
+  // Prefer cluster-level counts; fall back to link-level for an older server.
+  const conflicts = num(data.conflicts ?? counts.contradicted);
+  const hasGaps = data.gaps !== undefined && data.gaps !== null;
+  const gaps = num(data.gaps);
+  const supported = num(counts.supported);
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
+  const parts = [plural(conflicts, "conflict")];
+  if (hasGaps) parts.push(plural(gaps, "gap"));
+  parts.push(plural(supported, "verified cross-language claim"));
+
+  const tone = conflicts > 0 ? "ovr-alert" : gaps > 0 ? "ovr-warn" : "ovr-ok";
+
+  // Built with DOM APIs only: this is injected into Wikipedia pages.
   const badge = document.createElement("div");
   badge.className = "ovr-badge";
-  badge.innerHTML = `
-    <span class="ovr-pill ${conflicts > 0 ? "ovr-alert" : "ovr-ok"}">
-      One Verifiable Record: ${conflicts} conflict${conflicts === 1 ? "" : "s"},
-      ${supported} verified cross-language claim${supported === 1 ? "" : "s"}
-    </span>
-    <a class="ovr-link" target="_blank" rel="noopener"
-       href="${cfg.webBase}/?qid=${encodeURIComponent(data.qid)}">
-      Open merge view
-    </a>`;
+
+  const pill = document.createElement("span");
+  pill.className = `ovr-pill ${tone}`;
+  pill.textContent = `One Verifiable Record: ${parts.join(", ")}`;
+  badge.append(pill);
+
+  if (data.qid) {
+    const link = document.createElement("a");
+    link.className = "ovr-link";
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.href = `${cfg.webBase}/#/merge/${encodeURIComponent(data.qid)}`;
+    link.textContent = "Open merge view";
+    badge.append(link);
+  }
+
   heading.after(badge);
 })();

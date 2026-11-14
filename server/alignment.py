@@ -47,7 +47,9 @@ def align_article(qid: str, k: int | None = None):
                     """INSERT IGNORE INTO claim_links
                        (claim_a, claim_b, similarity, verdict, verdict_source)
                        VALUES (%s, %s, %s, 'unmatched', 'deterministic')""",
-                    (row["id"], claim_b, 1.0 - dist),
+                    # store each pair once, in canonical (lower id, higher id)
+                    # order, so a->b and b->a don't become two links
+                    (min(row["id"], claim_b), max(row["id"], claim_b), 1.0 - dist),
                 )
                 linked += cur.rowcount
         conn.commit()
