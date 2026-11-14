@@ -60,6 +60,41 @@ def split_chunks(text: str):
     return parts or [""]
 
 
+def replace_article_material(cur, article_id: int):
+    """Replace an article safely when a newer dump is imported.
+
+    Claims and verdicts are derived from a specific revision's chunks. Keeping
+    them after a chunk replacement would be worse than removing them; the
+    decision tables are system-versioned, so their prior state remains auditable.
+    """
+    cur.execute("SELECT id FROM claims WHERE article_id = %s", (article_id,))
+    claim_ids = [row[0] for row in cur.fetchall()]
+    if claim_ids:
+        marks = ",".join(["%s"] * len(claim_ids))
+        cur.execute(
+            f"UPDATE suggestions SET claim_link_id = NULL WHERE claim_link_id IN "
+            f"(SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks}))",
+            tuple(claim_ids + claim_ids),
+        )
+        cur.execute(
+            f"DELETE FROM reviews WHERE claim_link_id IN "
+            f"(SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks}))",
+            tuple(claim_ids + claim_ids),
+        )
+        cur.execute(
+            f"DELETE FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks})",
+            tuple(claim_ids + claim_ids),
+        )
+        cur.execute(f"DELETE FROM claim_embeddings WHERE claim_id IN ({marks})", tuple(claim_ids))
+        cur.execute(f"DELETE FROM claims WHERE id IN ({marks})", tuple(claim_ids))
+    cur.execute("SELECT id FROM chunks WHERE article_id = %s", (article_id,))
+    chunk_ids = [row[0] for row in cur.fetchall()]
+    if chunk_ids:
+        marks = ",".join(["%s"] * len(chunk_ids))
+        cur.execute(f"DELETE FROM chunk_embeddings WHERE chunk_id IN ({marks})", tuple(chunk_ids))
+    cur.execute("DELETE FROM chunks WHERE article_id = %s", (article_id,))
+
+
 PARQUET_RE = re.compile(r"^articles-(fi|sv|en)\.parquet$")
 
 
@@ -149,8 +184,9 @@ def main():
         cur.execute("SELECT id FROM articles WHERE lang = %s AND page_id = %s", (lang, page_id))
         (article_id,) = cur.fetchone()
 
-        # re-import is idempotent: replace the article's chunks
-        cur.execute("DELETE FROM chunks WHERE article_id = %s", (article_id,))
+        # Re-import is revision-safe: invalidate all derived material before
+        # changing its source chunks, while keeping system-versioned history.
+        replace_article_material(cur, article_id)
         for idx, chunk in enumerate(split_chunks(rec.get("text", ""))):
             cur.execute(
                 """INSERT INTO chunks (article_id, chunk_idx, section, text, revision_id)
@@ -164,8 +200,24 @@ def main():
             conn.commit()
             print(f"... {n_articles} articles, {n_chunks} chunks", file=sys.stderr)
 
+    # Materialise current high-confidence counterparts from the imported
+    # Wikidata sitelinks. The comparison API reads page_links—not a QID—so this
+    # one import-time operation gives all layers a concrete, refreshable page
+    # relationship. Other discovery sources can add lower-confidence rows with
+    # their own provenance without changing the comparison engine.
+    cur.execute(
+        """INSERT INTO page_links (page_a, page_b, source, confidence, evidence)
+           SELECT a.id, b.id, 'wikidata_sitelink', 1.0,
+                  JSON_OBJECT('qid', a.wikidata_qid)
+           FROM articles a
+           JOIN articles b ON b.wikidata_qid = a.wikidata_qid AND b.id <> a.id
+           WHERE a.wikidata_qid IS NOT NULL
+           ON DUPLICATE KEY UPDATE source = VALUES(source), confidence = VALUES(confidence),
+             evidence = VALUES(evidence), verified_at = CURRENT_TIMESTAMP"""
+    )
+    n_links = cur.rowcount
     conn.commit()
-    print(f"Imported {n_articles} articles, {n_chunks} chunks (preset: {args.size}).")
+    print(f"Imported {n_articles} articles, {n_chunks} chunks, {n_links} counterpart links (preset: {args.size}).")
     print("Next step: python jobs/embed.py")
 
 

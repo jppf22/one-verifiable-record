@@ -9,8 +9,8 @@ CREATE DATABASE IF NOT EXISTS wikipedia CHARACTER SET utf8mb4 COLLATE utf8mb4_un
 USE wikipedia;
 
 -- ----------------------------------------------------------------------------
--- articles: one row per (language, page). wikidata_qid is the join key that
--- aligns the same article across the fi / sv / en editions.
+-- articles: one row per PAGE (language + page_id + revision). wikidata_qid is only
+-- used at import time to derive page_links between counterpart pages.
 -- ----------------------------------------------------------------------------
 CREATE TABLE articles (
   id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -23,6 +23,28 @@ CREATE TABLE articles (
   UNIQUE KEY uq_lang_page (lang, page_id),
   KEY idx_qid (wikidata_qid),
   KEY idx_title (title(191))
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- page_links: interlanguage links between concrete pages. The unit of comparison
+-- is a PAGE (one lang + page_id + revision), compared with its counterpart
+-- pages in other languages. Stored in both directions (a->b and b->a) so
+-- "counterparts of page X" is a single indexed lookup. Derived from the
+-- dataset's Wikidata sitelinks at import time.
+-- ----------------------------------------------------------------------------
+CREATE TABLE page_links (
+  page_a      BIGINT UNSIGNED NOT NULL,
+  page_b      BIGINT UNSIGNED NOT NULL,
+  source      VARCHAR(32) NOT NULL DEFAULT 'wikidata_sitelink'
+              COMMENT 'wikidata_sitelink | mediawiki_langlink | entity_resolution | semantic_candidate | manual',
+  confidence  FLOAT NOT NULL DEFAULT 1.0,
+  evidence    JSON NULL COMMENT 'source-specific identifiers and refresh metadata',
+  verified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (page_a, page_b),
+  KEY idx_b (page_b),
+  CONSTRAINT fk_pl_a FOREIGN KEY (page_a) REFERENCES articles (id),
+  CONSTRAINT fk_pl_b FOREIGN KEY (page_b) REFERENCES articles (id)
 ) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
@@ -66,10 +88,18 @@ CREATE TABLE claims (
   chunk_id         BIGINT UNSIGNED NOT NULL,
   kind             ENUM('date','number','quantity','entity_relation','factoid') NOT NULL,
   subject          VARCHAR(512) NULL,
+  subject_entity   VARCHAR(32) NULL COMMENT 'Wikidata QID when entity linking resolved the subject',
   predicate        VARCHAR(255) NULL,
+  predicate_entity VARCHAR(32) NULL COMMENT 'Wikidata property ID when relation mapping resolved it',
+  object_entity    VARCHAR(32) NULL COMMENT 'Wikidata QID for entity-valued objects',
   value_text       VARCHAR(1024) NULL,
   value_normalized VARCHAR(512) NULL COMMENT 'canonical form: ISO date / plain number, for deterministic checks',
+  value_canonical  JSON NULL COMMENT 'typed canonical value: unit, calendar, range and precision',
+  qualifiers       JSON NULL COMMENT 'scope, as-of time, attribution and other fact qualifiers',
   statement_text   TEXT NOT NULL,
+  context_text     MEDIUMTEXT NULL COMMENT 'source paragraph/section surrounding the atomic claim',
+  citation_urls    JSON NULL COMMENT 'citation URLs or identifiers found with the claim',
+  extraction_confidence FLOAT NULL,
   revision_id      BIGINT UNSIGNED NULL,
   model_version    VARCHAR(64) NULL COMMENT 'extractor model that produced this claim',
   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -106,7 +136,10 @@ CREATE TABLE claim_links (
   claim_a        BIGINT UNSIGNED NOT NULL,
   claim_b        BIGINT UNSIGNED NOT NULL,
   similarity     FLOAT NOT NULL COMMENT '1 - cosine distance from MariaDB vector search',
-  verdict        ENUM('supported','contradicted','unverifiable','definition_mismatch','unmatched') NOT NULL,
+  relation       ENUM('same','related','different','unknown') NOT NULL DEFAULT 'unknown',
+  candidate_confidence FLOAT NULL COMMENT 'semantic matcher confidence; similarity alone is not a verdict',
+  verdict        ENUM('supported','contradicted','possible_match','possible_conflict',
+                      'unverifiable','definition_mismatch','unmatched') NOT NULL,
   verdict_source ENUM('deterministic','llm','human') NOT NULL,
   evidence       TEXT NULL COMMENT 'receipts: source passages',
   rationale      TEXT NULL,
