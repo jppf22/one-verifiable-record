@@ -7,6 +7,7 @@ Every UPDATE to claim_links writes a new row version (SYSTEM VERSIONING), so
 the full evolution of every verdict stays queryable in SQL.
 """
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -94,6 +95,7 @@ def llm_verdict(a: dict, b: dict):
                 "model": settings.llm_model,
                 "messages": messages,
                 "temperature": 0,
+                "reasoning_effort": settings.llm_reasoning_effort,
                 "response_format": {"type": "json_object"},
             },
             timeout=60,
@@ -163,8 +165,9 @@ def grade_links(pairs, touch_ids=()) -> list:
 
     Returns [{id, before, after, changed}].
     """
-    results = []
-    for p in pairs:
+    touch_ids = set(touch_ids)
+
+    def grade_and_store(p):
         a, b = _side(p, "a"), _side(p, "b")
         verdict, source, rationale = grade_pair(a, b)
         changed = verdict != p["verdict"]
@@ -179,10 +182,17 @@ def grade_links(pairs, touch_ids=()) -> list:
                 (verdict, source, rationale, a["statement_text"], b["statement_text"],
                  p["link_id"]),
             )
-        results.append(
-            {"id": p["link_id"], "before": p["verdict"], "after": verdict, "changed": changed}
-        )
-    return results
+        return {"id": p["link_id"], "before": p["verdict"], "after": verdict, "changed": changed}
+
+    pairs = list(pairs)
+    if not pairs:
+        return []
+    # LLM calls are network-bound and each verdict write gets its own short
+    # database connection through execute(), so parallel grading is safe while
+    # preserving the input order expected by callers.
+    workers = min(settings.verdict_concurrency, len(pairs))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(grade_and_store, pairs))
 
 
 def grade_unmatched(qid: str) -> list:

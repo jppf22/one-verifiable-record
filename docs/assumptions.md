@@ -50,8 +50,10 @@ Assumed (coordinator):
   old `api.verda.com` URL and `kimi-k3.1-pro` id were wrong. The gateway has **no
   `/v1/embeddings`**, so e5-large is served by our own `embedder` container
   (OpenAI-style API). Q&A query embedding and `jobs/embed.py --endpoint` use it.
-- D5. Extraction sends only the first ~6,000 characters per article (lead + opening
-  sections). That caps cost and covers the facts editions most often share.
+- D5. Extraction sends **every current source chunk**. Requests are batched at roughly
+  6,000 characters to respect the model context window, but batching never selects a
+  lead section or a preset group of properties. `--max-claims 0` is the default (no
+  extractor-side cap); deployments can opt into a cap explicitly for cost control.
 - D6. Claim `statement_text` stays in the source language (the receipt). `subject` and
   `predicate` are canonical English snake_case, so cross-language claims share a
   vocabulary.
@@ -70,6 +72,11 @@ Assumed (coordinator):
   only rows matching `articles.revision_id`; after a refresh, extraction and claim
   embedding run again for the new revision. `db/migrations/001_live_refresh.sql` upgrades
   databases created before this behaviour.
+- D11. A claim's `predicate` and `kind` are an open extractor-produced vocabulary.
+  Alignment retrieves all same-predicate candidates in every other available language,
+  plus the nearest semantic candidates per language. Neither list is hard-coded in the
+  application. The schema migration `002_open_claim_taxonomy.sql` changes the former
+  demonstration-only `kind` enum to a free-form label.
 
 ## Assumed (extension)
 - X1. (extension) If the server's badge response has no `gaps` field (older server), the

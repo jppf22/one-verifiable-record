@@ -9,12 +9,14 @@ languages, the LLM also emits a canonical English ``subject`` / ``predicate``
   date            ISO 8601 at the precision stated: YYYY, YYYY-MM or YYYY-MM-DD
   number/quantity plain decimal, no separators ("674500"); unit goes in value_text
 
-Only the first ``--max-chars`` characters of each article are sent (lead section
-and the opening sections), which keeps cost bounded and covers the facts every
-edition tends to state.
+Every source chunk is sent to the extractor.  Chunks are batched only to stay
+inside the model context window; no section or relation is selected by a
+hard-coded property list.
 
-Idempotent: articles that already have claims are skipped, so the job can be
-interrupted and resumed.
+Idempotent by default: articles that already have claims are skipped, so the
+job can be interrupted and resumed. ``--replace-current`` deliberately
+re-extracts the selected current revisions after removing their derived links
+and embeddings; system-versioned claim/link history remains in MariaDB.
 
 Usage:
   python extract_claims.py --pilot 20               # best-covered tri-lingual topics
@@ -32,33 +34,37 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import httpx
 import mariadb
 
-KINDS = {"date", "number", "quantity", "entity_relation", "factoid"}
 DATE_RE = re.compile(r"^-?\d{1,4}(-\d{2}(-\d{2})?)?$")
 NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 SYSTEM_PROMPT = """You extract atomic, verifiable factual claims from one Wikipedia article excerpt.
 The excerpt is split into chunks marked [#N]. Reply ONLY with JSON:
-{"claims": [{"chunk": N, "kind": "date|number|quantity|entity_relation|factoid",
+{"claims": [{"chunk": N, "kind": "...",
   "subject": "...", "predicate": "...", "value_text": "...", "value_normalized": "...",
   "statement": "..."}]}
 
 Rules:
-- One fact per claim. Prefer facts another language edition could confirm or contradict:
-  dates, years, numbers, places, office holders, memberships, founders, outcomes.
+- One fact per claim. Extract every concrete, source-supported fact that another
+  language edition could confirm or contradict. This includes dates, years,
+  numbers, places, office holders, memberships, founders, outcomes, material,
+  classification, composition, and relations not named here.
 - The page may be about a person, place, organization, event, creative work, species,
   or concept. Extract the facts that fit that subject; do not assume it is a biography.
 - "statement": a short self-contained sentence in the SAME LANGUAGE as the excerpt, close to
   the source wording. Resolve pronouns ("he" -> the person's name).
 - "subject": the entity the claim is about, in English (e.g. "Urho Kekkonen").
-- "predicate": canonical English snake_case relation (e.g. birth_date, birth_place,
-  death_date, population, area_km2, founded, office_held, spouse, member_of, signed_on).
-  Use the same predicate for the same kind of fact every time.
+- "kind": a short, optional descriptive label. It is not a fixed vocabulary; use
+  "date", "number", or "quantity" when those normalizations apply, otherwise any
+  useful lower_snake_case label.
+- "predicate": canonical English snake_case relation. It is an open vocabulary:
+  introduce the relation that accurately describes the fact and use the same
+  predicate for the same relation every time. Examples are illustrative only.
 - "value_text": the value as written in the source.
 - "value_normalized": for kind=date use ISO at the stated precision (YYYY, YYYY-MM or
   YYYY-MM-DD; BCE years negative); for number/quantity a plain decimal without thousands
   separators or units; otherwise a short canonical English value (e.g. "Lapua").
 - "chunk": the [#N] the claim comes from.
-- At most %(max_claims)d claims. Skip opinions, vague statements and navigation text."""
+- %(claim_limit)s Skip opinions, vague statements and navigation text."""
 
 
 def connect():
@@ -98,7 +104,8 @@ def pick_qids(cur, args) -> list:
     return qids[: args.pilot] if args.pilot else qids
 
 
-def article_excerpt(cur, article_id: int, max_chars: int):
+def article_chunks(cur, article_id: int):
+    """Return every current source chunk, without a lead-section cutoff."""
     chunks = rows(
         cur,
         """SELECT ch.id, ch.chunk_idx, ch.text FROM chunks ch
@@ -107,14 +114,7 @@ def article_excerpt(cur, article_id: int, max_chars: int):
            ORDER BY ch.chunk_idx""",
         (article_id,),
     )
-    picked, used = [], 0
-    for ch in chunks:
-        if used >= max_chars:
-            break
-        text = (ch["text"] or "")[: max_chars - used]
-        picked.append((ch, text))
-        used += len(text)
-    return picked
+    return [(ch, ch["text"] or "") for ch in chunks]
 
 
 def call_llm(http: httpx.Client, args, title: str, lang: str, picked) -> list:
@@ -123,9 +123,15 @@ def call_llm(http: httpx.Client, args, title: str, lang: str, picked) -> list:
         "model": args.model,
         "temperature": 0,
         "max_tokens": args.max_tokens,
+        "reasoning_effort": args.reasoning_effort,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT % {"max_claims": args.max_claims}},
+            {"role": "system", "content": SYSTEM_PROMPT % {
+                "claim_limit": (
+                    f"At most {args.max_claims} claims for this batch."
+                    if args.max_claims else "Extract all qualifying claims in this batch."
+                ),
+            }},
             {"role": "user", "content": f"Article: {title} (language: {lang})\n\n{excerpt}"},
         ],
     }
@@ -136,17 +142,28 @@ def call_llm(http: httpx.Client, args, title: str, lang: str, picked) -> list:
             continue
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"] or ""
+        # Some reasoning-capable OpenAI-compatible gateways occasionally put a
+        # short preamble before an otherwise valid JSON object.  Treat the
+        # first JSON object as the structured answer rather than discarding a
+        # whole article because of that presentation detail.
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
-        return json.loads(content).get("claims", [])
+        start = content.find("{")
+        if start < 0:
+            raise ValueError("LLM returned no JSON object")
+        data, _ = json.JSONDecoder().raw_decode(content[start:])
+        claims = data.get("claims", []) if isinstance(data, dict) else []
+        if not isinstance(claims, list):
+            raise ValueError("LLM JSON field 'claims' is not a list")
+        return claims
     r.raise_for_status()
     return []
 
 
 def clean(claim: dict, chunk_ids: dict):
     """Validate one LLM claim; return a DB row tuple or None."""
-    kind = (claim.get("kind") or "").strip()
+    kind = (claim.get("kind") or "fact").strip().lower()
     statement = (claim.get("statement") or "").strip()
-    if kind not in KINDS or not statement:
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", kind) or not statement:
         return None
     norm = (str(claim.get("value_normalized") or "")).strip() or None
     if kind == "date" and norm and not DATE_RE.match(norm):
@@ -167,6 +184,41 @@ def clean(claim: dict, chunk_ids: dict):
     )
 
 
+def remove_current_claims(cur, article_id: int, revision_id):
+    """Remove only derived state for one selected current article revision.
+
+    `claims` and `claim_links` are system-versioned, so this records their end
+    time instead of erasing audit history. Claim embeddings are deliberately
+    unversioned cache rows and must be regenerated for the replacement claims.
+    """
+    cur.execute(
+        "SELECT id FROM claims WHERE article_id = %s AND revision_id <=> %s",
+        (article_id, revision_id),
+    )
+    ids = [row[0] for row in cur.fetchall()]
+    if not ids:
+        return
+    marks = ",".join(["%s"] * len(ids))
+    values = tuple(ids)
+    # Reviews belong to a specific old claim link. Retire them before retiring
+    # that link; all three tables are system-versioned, so their audit history
+    # is retained but no review is accidentally attached to a replacement link.
+    cur.execute(
+        f"SELECT id FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks})",
+        values + values,
+    )
+    link_ids = [row[0] for row in cur.fetchall()]
+    if link_ids:
+        link_marks = ",".join(["%s"] * len(link_ids))
+        cur.execute(f"DELETE FROM reviews WHERE claim_link_id IN ({link_marks})", tuple(link_ids))
+    cur.execute(f"DELETE FROM claim_embeddings WHERE claim_id IN ({marks})", values)
+    cur.execute(
+        f"DELETE FROM claim_links WHERE claim_a IN ({marks}) OR claim_b IN ({marks})",
+        values + values,
+    )
+    cur.execute(f"DELETE FROM claims WHERE id IN ({marks})", values)
+
+
 def extract_article(args, art: dict) -> tuple:
     """Returns (article, n_claims, error)."""
     conn = connect()
@@ -177,18 +229,34 @@ def extract_article(args, art: dict) -> tuple:
                AND revision_id <=> %s""",
             (art["id"], art["revision_id"]),
         )
-        if cur.fetchone()[0]:
+        if cur.fetchone()[0] and not args.replace_current:
             return art, 0, "skipped (current revision already has claims)"
-        picked = article_excerpt(cur, art["id"], args.max_chars)
-        if not picked:
+        if args.replace_current:
+            remove_current_claims(cur, art["id"], art["revision_id"])
+        chunks = article_chunks(cur, art["id"])
+        if not chunks:
             return art, 0, "no chunks"
+        # Each input chunk is included exactly once.  `batch_chars` limits an
+        # individual request, not the portion of the article that is audited.
+        batches, batch, used = [], [], 0
+        for item in chunks:
+            text_len = len(item[1])
+            if batch and used + text_len > args.batch_chars:
+                batches.append(batch)
+                batch, used = [], 0
+            batch.append(item)
+            used += text_len
+        if batch:
+            batches.append(batch)
+        good = []
         with httpx.Client(
             timeout=args.timeout,
             headers={"Authorization": f"Bearer {args.api_key}"},
         ) as http:
-            claims = call_llm(http, args, art["title"], art["lang"], picked)
-        chunk_ids = {ch["chunk_idx"]: ch["id"] for ch, _ in picked}
-        good = [row for row in (clean(c, chunk_ids) for c in claims) if row]
+            for picked in batches:
+                claims = call_llm(http, args, art["title"], art["lang"], picked)
+                chunk_ids = {ch["chunk_idx"]: ch["id"] for ch, _ in picked}
+                good.extend(row for row in (clean(c, chunk_ids) for c in claims) if row)
         if args.dry_run:
             for row in good:
                 print(f"  [{art['lang']}] {row[1]:<15} {row[3]!s:<18} {row[5]!s:<12} {row[6]}")
@@ -216,14 +284,30 @@ def main():
     sel.add_argument("--pilot", type=int, help="the N best-covered tri-lingual topics")
     sel.add_argument("--all-trilingual", action="store_true", help="every topic in fi+sv+en")
     ap.add_argument("--concurrency", type=int, default=4)
-    ap.add_argument("--max-chars", type=int, default=6000)
-    ap.add_argument("--max-claims", type=int, default=30)
+    ap.add_argument("--batch-chars", type=int, default=6000,
+                    help="maximum characters per model request; every chunk is processed")
+    ap.add_argument("--max-claims", type=int, default=0,
+                    help="maximum claims per request (0 = no extractor-side cap)")
+    ap.add_argument("--replace-current", action="store_true",
+                    help="re-extract selected current revisions; removes their derived links/embeddings")
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--dry-run", action="store_true", help="print claims, don't write")
     ap.add_argument("--model", default=os.environ.get("LLM_MODEL", "kimi-k3-1-pro"))
+    ap.add_argument("--reasoning-effort", default=os.environ.get("LLM_REASONING_EFFORT", "low"),
+                    help="provider reasoning effort; low preserves room for structured output")
     ap.add_argument("--base-url", default=os.environ.get("VERDA_BASE_URL", "https://inference.verda.com/v1"))
     args = ap.parse_args()
+    if args.batch_chars <= 0:
+        ap.error("--batch-chars must be greater than zero")
+    if args.max_claims < 0:
+        ap.error("--max-claims cannot be negative")
+    if args.replace_current and args.concurrency > 1:
+        # Replacing different editions of one QID deletes their shared derived
+        # claim_links. Serialise that destructive phase so MariaDB does not
+        # abort concurrent transactions with "Record has changed".
+        print("--replace-current uses concurrency 1 to preserve shared claim links", file=sys.stderr)
+        args.concurrency = 1
     args.api_key = os.environ.get("VERDA_API_KEY", "")
     if not args.api_key:
         sys.exit("VERDA_API_KEY is not set")
