@@ -4,14 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>One Verifiable Record</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="/css/base.css">
+  <link rel="stylesheet" href="/css/merge.css">
+  <link rel="stylesheet" href="/css/panels.css">
 </head>
 <body>
-  <header>
-    <h1>One Verifiable Record</h1>
-    <p class="tagline">Wikipedia editions are branches. This is the merge tool.</p>
-    <form id="search-form">
-      <input id="search-input" placeholder="Search an article tracked across fi / sv / en…" autocomplete="off">
+  <header id="app-header">
+    <div class="brand">
+      <a href="#/" class="home-link"><h1>One Verifiable Record</h1></a>
+      <p class="tagline">Wikipedia editions are branches. This is the merge tool.</p>
+    </div>
+    <div id="reviewer-slot"></div>
+    <form id="search-form" role="search">
+      <input id="search-input" placeholder="Search an article tracked across fi / sv / en…" autocomplete="off" aria-label="Search articles">
       <button type="submit">Open merge view</button>
     </form>
   </header>
@@ -20,30 +25,24 @@
     <section id="article-picker">
       <p class="muted">Search for an article to see how the Finnish, Swedish and English
       editions agree, conflict, or leave gaps in each other.</p>
-      <div id="results" class="results"></div>
+      <div id="results" class="results" role="listbox"></div>
     </section>
 
     <section id="merge-view" hidden>
       <div id="merge-header"></div>
+      <div id="summary-bar"></div>
+      <div id="filters"></div>
+      <div id="recheck-banner" hidden></div>
       <div id="clusters"></div>
-      <section id="suggestions" hidden></section>
-
-      <section id="qa">
-        <h2>Ask this article</h2>
-        <form id="qa-form">
-          <input id="qa-input" placeholder="e.g. What birth date do the editions give?" autocomplete="off">
-          <button type="submit">Ask</button>
-        </form>
-        <div id="qa-answer"></div>
-      </section>
+      <section id="suggestions"></section>
+      <section id="qa"></section>
     </section>
   </main>
 
-  <dialog id="modal">
-    <div id="modal-body"></div>
-    <button id="modal-close">Close</button>
-  </dialog>
+  <dialog id="history-dialog"></dialog>
+  <dialog id="help-dialog"></dialog>
+  <div id="toasts" aria-live="polite"></div>
 
-  <script src="app.js"></script>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>
