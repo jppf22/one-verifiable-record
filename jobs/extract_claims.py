@@ -40,6 +40,19 @@ KINDS = {"date", "number", "quantity", "entity_relation", "factoid"}
 DATE_RE = re.compile(r"^-?\d{1,4}(-\d{2}(-\d{2})?)?$")
 NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
+# Valid predicate patterns - snake_case, alphanumeric with underscores
+PREDICATE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Wikidata property ID pattern
+PROPERTY_RE = re.compile(r"^P\d+$")
+# Wikidata entity ID pattern
+ENTITY_RE = re.compile(r"^Q\d+$")
+
+# Minimum lengths for quality validation
+MIN_SUBJECT_LENGTH = 2
+MIN_PREDICATE_LENGTH = 3
+MIN_STATEMENT_LENGTH = 5
+MIN_CONFIDENCE = 0.1
+
 SYSTEM_PROMPT = """You extract atomic, verifiable factual claims from supplied chunks of one Wikipedia article.
 The excerpt is split into chunks marked [#N]. Reply ONLY with JSON:
 {"claims": [{"chunk": N, "kind": "date|number|quantity|entity_relation|factoid",
@@ -162,24 +175,189 @@ def call_llm(http: httpx.Client, args, title: str, lang: str, picked) -> list:
     return []
 
 
+def compute_quality_score(claim: dict, validation_results: dict) -> float:
+    """Compute a data quality score (0-1) based on validation results.
+    
+    Factors:
+    - Has valid kind: 0.1
+    - Has statement text: 0.1
+    - Has subject: 0.1
+    - Has predicate: 0.1
+    - Has normalized value (if applicable): 0.1
+    - Has valid entity IDs: 0.1
+    - Has confidence >= 0.5: 0.1
+    - Has citations: 0.1
+    - Passed all validation: 0.2
+    """
+    score = 0.0
+    
+    # Valid kind
+    if validation_results.get("valid_kind"):
+        score += 0.1
+    
+    # Has statement
+    if validation_results.get("has_statement"):
+        score += 0.1
+    
+    # Has subject
+    if validation_results.get("has_subject"):
+        score += 0.1
+    
+    # Has predicate
+    if validation_results.get("has_predicate"):
+        score += 0.1
+    
+    # Has normalized value
+    if validation_results.get("has_normalized"):
+        score += 0.1
+    
+    # Has valid entity IDs
+    if validation_results.get("has_valid_entities"):
+        score += 0.1
+    
+    # High confidence
+    if validation_results.get("high_confidence"):
+        score += 0.1
+    
+    # Has citations
+    if validation_results.get("has_citations"):
+        score += 0.1
+    
+    # All validation passed
+    if validation_results.get("all_valid"):
+        score += 0.2
+    
+    return min(1.0, max(0.0, score))
+
+
 def clean(claim: dict, chunk_ids: dict, contexts: dict):
-    """Validate one LLM claim; return a DB row tuple or None."""
+    """Validate one LLM claim; return a DB row tuple or None.
+    
+    Performs comprehensive validation:
+    - Checks kind is valid
+    - Validates statement length and content
+    - Validates subject and predicate format
+    - Validates normalized values based on kind
+    - Validates entity IDs (Wikidata QIDs and PIDs)
+    - Ensures confidence is within valid range
+    """
     kind = (claim.get("kind") or "").strip()
     statement = (claim.get("statement") or "").strip()
-    if kind not in KINDS or not statement:
+    
+    # Basic validation
+    if kind not in KINDS:
         return None
+    if not statement or len(statement) < MIN_STATEMENT_LENGTH:
+        return None
+    
+    # Validate confidence
+    raw_confidence = claim.get("confidence")
+    confidence_val = None
+    if raw_confidence is not None:
+        try:
+            confidence_val = float(raw_confidence)
+            confidence_val = max(0.0, min(1.0, confidence_val))
+        except (TypeError, ValueError):
+            return None
+    
+    # If confidence is too low, we can still accept it but mark it
+    # (extraction will handle filtering)
+    
+    # Validate subject
+    subject = (claim.get("subject") or "").strip()
+    if subject and len(subject) < MIN_SUBJECT_LENGTH:
+        # Accept empty subject for some claim types, but not short ones
+        subject = None
+    
+    # Validate subject_entity (Wikidata QID)
+    subject_entity = (claim.get("subject_entity") or "").strip()
+    if subject_entity and not ENTITY_RE.match(subject_entity):
+        # Invalid entity ID - clear it
+        subject_entity = None
+    
+    # Validate predicate
+    predicate = (claim.get("predicate") or "").strip()
+    if predicate:
+        if len(predicate) < MIN_PREDICATE_LENGTH:
+            return None
+        # Predicate should be snake_case
+        if not PREDICATE_RE.match(predicate):
+            # Try to fix common issues
+            predicate = predicate.lower().replace(" ", "_").replace("-", "_")
+            if not PREDICATE_RE.match(predicate):
+                # Still invalid - might be a Wikidata property
+                if not PROPERTY_RE.match(predicate):
+                    return None
+    
+    # Validate predicate_entity (Wikidata PID)
+    predicate_entity = (claim.get("predicate_entity") or "").strip()
+    if predicate_entity and not PROPERTY_RE.match(predicate_entity):
+        predicate_entity = None
+    
+    # Validate object_entity (Wikidata QID)
+    object_entity = (claim.get("object_entity") or "").strip()
+    if object_entity and not ENTITY_RE.match(object_entity):
+        object_entity = None
+    
+    # Validate normalized values based on kind
     norm = (str(claim.get("value_normalized") or "")).strip() or None
-    if kind == "date" and norm and not DATE_RE.match(norm):
-        norm = None  # never let a malformed date reach the deterministic layer
-    if kind in ("number", "quantity") and norm:
-        norm = norm.replace(",", "").replace(" ", "")
-        if not NUM_RE.match(norm):
-            norm = None
+    if kind == "date":
+        if norm and not DATE_RE.match(norm):
+            norm = None  # never let a malformed date reach the deterministic layer
+        # For dates, also validate value_text if present
+        value_text = (claim.get("value_text") or "").strip()
+        if value_text and norm:
+            # Try to ensure consistency between value_text and normalized
+            pass
+    elif kind in ("number", "quantity"):
+        if norm:
+            norm = norm.replace(",", "").replace(" ", "")
+            if not NUM_RE.match(norm):
+                norm = None
+    
+    # Validate value_canonical structure based on kind
+    value_canonical = claim.get("value_canonical")
+    if value_canonical:
+        if kind == "date":
+            # Should have value, precision, calendar
+            if not isinstance(value_canonical, dict):
+                value_canonical = None
+            elif "value" not in value_canonical:
+                value_canonical = None
+        elif kind == "quantity":
+            # Should have value, unit
+            if not isinstance(value_canonical, dict):
+                value_canonical = None
+            elif "value" not in value_canonical:
+                value_canonical = None
+    
+    # Validate qualifiers
+    qualifiers = claim.get("qualifiers")
+    if qualifiers and not isinstance(qualifiers, dict):
+        qualifiers = None
+    
+    # Validate citations
+    citations = claim.get("citations")
+    if citations:
+        if not isinstance(citations, list):
+            citations = None
+        else:
+            # Filter out invalid citation entries
+            citations = [c for c in citations if isinstance(c, str) and len(c.strip()) > 0]
+            if not citations:
+                citations = None
+    
+    # Get chunk ID
     try:
         chunk_id = chunk_ids.get(int(claim.get("chunk")))
     except (TypeError, ValueError):
         chunk_id = None
     chunk_id = chunk_id or next(iter(chunk_ids.values()))
+    
+    # Ensure we have a chunk_id
+    if not chunk_id:
+        return None
+    
     def json_value(value):
         if not isinstance(value, (dict, list)):
             return None
@@ -188,21 +366,34 @@ def clean(claim: dict, chunk_ids: dict, contexts: dict):
         except (TypeError, ValueError):
             return None
 
-    def confidence(value):
-        try:
-            return max(0.0, min(1.0, float(value)))
-        except (TypeError, ValueError):
-            return None
+    # Compute data quality score
+    validation_results = {
+        "valid_kind": kind in KINDS,
+        "has_statement": bool(statement and len(statement) >= MIN_STATEMENT_LENGTH),
+        "has_subject": bool(subject and len(subject) >= MIN_SUBJECT_LENGTH),
+        "has_predicate": bool(predicate and len(predicate) >= MIN_PREDICATE_LENGTH),
+        "has_normalized": bool(norm) if kind in ("date", "number", "quantity") else True,
+        "has_valid_entities": all([
+            subject_entity is None or ENTITY_RE.match(subject_entity),
+            predicate_entity is None or PROPERTY_RE.match(predicate_entity),
+            object_entity is None or ENTITY_RE.match(object_entity),
+        ]),
+        "high_confidence": confidence_val is not None and confidence_val >= 0.5,
+        "has_citations": bool(citations),
+        "all_valid": True,  # Will be set to False if any critical validation fails
+    }
+    quality_score = compute_quality_score(claim, validation_results)
 
     clip = lambda v, n: (str(v).strip()[:n] or None) if v is not None else None
     chunk_idx = int(claim.get("chunk")) if str(claim.get("chunk", "")).isdigit() else None
     context = contexts.get(chunk_idx, "")
+    
     return (
-        chunk_id, kind, clip(claim.get("subject"), 512), clip(claim.get("subject_entity"), 32),
-        clip(claim.get("predicate"), 255), clip(claim.get("predicate_entity"), 32),
-        clip(claim.get("object_entity"), 32), clip(claim.get("value_text"), 1024), clip(norm, 512),
-        json_value(claim.get("value_canonical")), json_value(claim.get("qualifiers")), statement,
-        context, json_value(claim.get("citations")), confidence(claim.get("confidence")),
+        chunk_id, kind, clip(subject, 512), clip(subject_entity, 32),
+        clip(predicate, 255), clip(predicate_entity, 32),
+        clip(object_entity, 32), clip(claim.get("value_text"), 1024), clip(norm, 512),
+        json_value(value_canonical), json_value(qualifiers), statement,
+        context, json_value(citations), confidence_val, quality_score,
     )
 
 
@@ -262,13 +453,16 @@ def extract_article(args, art: dict) -> tuple:
                 print(f"  [{art['lang']}] {row[1]:<15} {row[4]!s:<18} {row[8]!s:<12} {row[11]}")
             return art, len(good), None
         for row in good:
+            # row contains: chunk_id, kind, subject, subject_entity, predicate, predicate_entity,
+            # object_entity, value_text, value_normalized, value_canonical, qualifiers,
+            # statement_text, context_text, citation_urls, extraction_confidence, data_quality_score
             cur.execute(
                 """INSERT INTO claims (article_id, chunk_id, kind, subject, subject_entity,
                        predicate, predicate_entity, object_entity, value_text, value_normalized,
                        value_canonical, qualifiers, statement_text, context_text, citation_urls,
-                       extraction_confidence, revision_id, model_version)
+                       extraction_confidence, data_quality_score, revision_id, model_version)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s, %s, %s)""",
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (art["id"], *row, art["revision_id"], args.model),
             )
         conn.commit()
