@@ -439,3 +439,25 @@ def qa(qid: str, q: str = Query(min_length=2, max_length=1000), lang: Optional[s
     if len(question) < 2:
         raise HTTPException(422, "q must contain at least two non-whitespace characters")
     return rag.answer(_require_qid(qid), question, lang)
+
+
+@app.get("/api/review/queue")
+def review_queue(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None),
+    lang: Optional[str] = Query(None),
+    reviewer: Optional[str] = Query(None),
+):
+    """Reviewer dashboard: paginated queue of claim links needing review.
+    
+    Filters:
+    - status: verdict type (contradicted, possible_conflict, possible_match, etc.)
+    - lang: filter by claim language (fi, sv, en)
+    - reviewer: show only links this reviewer has already voted on
+    
+    Returns: {items: [...], total: N, limit: N, offset: N}
+    Each item contains link details, both claims, and their pages.
+    """
+    from pages import review_queue as pages_review_queue
+    return pages_review_queue(limit, offset, status, lang, reviewer)
