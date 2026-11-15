@@ -1,5 +1,17 @@
 """Server configuration (env-driven)."""
+from enum import Enum
+from typing import Optional
 from pydantic_settings import BaseSettings
+
+
+class SimplificationMode(str, Enum):
+    """Five toggleable simplification modes for the codebase."""
+    NONE = "none"              # Full functionality
+    MINIMAL = "minimal"        # Core comparison only: no LLM, no reviews, no patches, no Q&A
+    READ_ONLY = "read_only"    # Disable all write operations: no POST endpoints, only GET
+    SINGLE_LANGUAGE = "single_language"  # Focus on one language only, no cross-language comparison
+    DETERMINISTIC = "deterministic"  # Skip LLM layer, use only deterministic verdicts
+    NO_EXTENSION = "no_extension"  # Remove all extension-specific functionality
 
 
 class Settings(BaseSettings):
@@ -38,5 +50,58 @@ class Settings(BaseSettings):
     # browser writes without putting a costly LLM endpoint directly on port 8000.
     post_rate_limit_per_minute: int = 12
 
+    # ========================================================================
+    # SIMPLIFICATION MODES
+    # ========================================================================
+    # Enable one simplification mode at a time via environment variable
+    # Options: none, minimal, read_only, single_language, deterministic, no_extension
+    simplification_mode: SimplificationMode = SimplificationMode.NONE
+    
+    # For single_language mode: which language to focus on (fi, sv, en)
+    single_language: str = "en"
+    
+    # For deterministic mode: skip LLM layer entirely
+    force_deterministic_verdicts: bool = False
+    
+    # ========================================================================
 
+    @property
+    def is_minimal_mode(self) -> bool:
+        return self.simplification_mode == SimplificationMode.MINIMAL
+    
+    @property
+    def is_read_only_mode(self) -> bool:
+        return self.simplification_mode == SimplificationMode.READ_ONLY
+    
+    @property
+    def is_single_language_mode(self) -> bool:
+        return self.simplification_mode == SimplificationMode.SINGLE_LANGUAGE
+    
+    @property
+    def is_deterministic_mode(self) -> bool:
+        return self.simplification_mode == SimplificationMode.DETERMINISTIC
+    
+    @property
+    def is_no_extension_mode(self) -> bool:
+        return self.simplification_mode == SimplificationMode.NO_EXTENSION
+    
+    def get_simplification_config(self) -> dict:
+        """Get the full simplification configuration."""
+        return {
+            "mode": self.simplification_mode.value,
+            "is_minimal": self.is_minimal_mode,
+            "is_read_only": self.is_read_only_mode,
+            "is_single_language": self.is_single_language_mode,
+            "single_language": self.single_language,
+            "is_deterministic": self.is_deterministic_mode,
+            "is_no_extension": self.is_no_extension_mode,
+        }
+
+
+# Global settings instance
 settings = Settings()
+
+
+def get_simplification():
+    """Get the current simplification configuration as a dict."""
+    return settings.get_simplification_config()

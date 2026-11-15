@@ -42,7 +42,7 @@ import patches
 import rag
 import recheck
 import verdicts
-from config import settings
+from config import settings, get_simplification
 from db import insert, placeholders, query, query_one
 
 app = FastAPI(title="One Verifiable Record", version="0.1.0")
@@ -54,6 +54,128 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# SIMPLIFICATION MODE MIDDLEWARE
+# =============================================================================
+
+# Endpoints that write data (POST) - can be blocked in read-only mode
+WRITE_ENDPOINTS = [
+    "/api/align",
+    "/api/embed",
+    "/api/recheck",
+    "/api/reviews",
+    "/api/suggestions",
+]
+
+# Endpoints that use LLM - can be blocked in minimal/deterministic modes
+LLM_ENDPOINTS = [
+    "/api/align",
+    "/api/embed",
+    "/api/recheck",
+    "/api/qa",
+]
+
+# Endpoints for extension - can be blocked in no_extension mode
+EXTENSION_ENDPOINTS = [
+    "/api/badge",
+    "/api/extension/resolve",
+]
+
+# Endpoints that involve reviews - can be blocked in minimal mode
+REVIEW_ENDPOINTS = [
+    "/api/reviews",
+    "/api/review/queue",
+]
+
+# Endpoints for patches - can be blocked in minimal mode
+PATCH_ENDPOINTS = [
+    "/api/suggestions",
+]
+
+
+@app.middleware("http")
+async def simplification_middleware(request: Request, call_next):
+    """Enforce simplification mode restrictions on API endpoints."""
+    path = request.url.path
+    simp = get_simplification()
+    
+    # Mode 1: READ_ONLY - Block all POST requests and write operations
+    if simp["is_read_only"]:
+        if request.method == "POST":
+            blocked_endpoints = [p for p in WRITE_ENDPOINTS if path.startswith(p)]
+            if blocked_endpoints:
+                return JSONResponse(
+                    {
+                        "error": "Read-only mode enabled",
+                        "detail": f"POST requests are disabled in read-only mode. Endpoint: {path}",
+                        "simplification": simp,
+                    },
+                    status_code=403,
+                )
+    
+    # Mode 2: MINIMAL - Block LLM, reviews, patches, Q&A
+    if simp["is_minimal"]:
+        # Block LLM endpoints
+        llm_matches = [p for p in LLM_ENDPOINTS if path.startswith(p)]
+        if llm_matches and request.method == "POST":
+            return JSONResponse(
+                {
+                    "error": "Minimal mode enabled",
+                    "detail": f"LLM operations disabled. Use deterministic-only or read-only mode for simpler operations.",
+                    "simplification": simp,
+                },
+                status_code=403,
+            )
+        
+        # Block review endpoints
+        review_matches = [p for p in REVIEW_ENDPOINTS if path.startswith(p)]
+        if review_matches:
+            return JSONResponse(
+                {
+                    "error": "Minimal mode enabled",
+                    "detail": "Human review features are disabled in minimal mode.",
+                    "simplification": simp,
+                },
+                status_code=403,
+            )
+        
+        # Block patch/suggestion endpoints
+        patch_matches = [p for p in PATCH_ENDPOINTS if path.startswith(p)]
+        if patch_matches:
+            return JSONResponse(
+                {
+                    "error": "Minimal mode enabled",
+                    "detail": "Patch generation and export are disabled in minimal mode.",
+                    "simplification": simp,
+                },
+                status_code=403,
+            )
+    
+    # Mode 3: NO_EXTENSION - Block extension-specific endpoints
+    if simp["is_no_extension"]:
+        ext_matches = [p for p in EXTENSION_ENDPOINTS if path.startswith(p)]
+        if ext_matches:
+            return JSONResponse(
+                {
+                    "error": "Extension mode disabled",
+                    "detail": f"Browser extension endpoints are disabled in no-extension mode.",
+                    "simplification": simp,
+                },
+                status_code=403,
+            )
+    
+    # Mode 4: SINGLE_LANGUAGE - Filter results to single language
+    # This is handled in the endpoint logic, not by blocking
+    
+    # Mode 5: DETERMINISTIC - Force deterministic-only verdicts
+    # This is handled in verdicts.py
+    
+    return await call_next(request)
+
+
+# =============================================================================
 
 
 # Alignment and re-checks can make multiple inference calls. This modest,
@@ -461,3 +583,152 @@ def review_queue(
     """
     from pages import review_queue as pages_review_queue
     return pages_review_queue(limit, offset, status, lang, reviewer)
+
+
+# =============================================================================
+# SIMPLIFICATION CONFIGURATION ENDPOINTS
+# =============================================================================
+
+class SimplificationToggle(BaseModel):
+    """Request to toggle simplification mode."""
+    mode: str  # one of: none, minimal, read_only, single_language, deterministic, no_extension
+    single_language: Optional[str] = None  # only for single_language mode
+
+
+@app.get("/api/simplification")
+def get_simplification_config():
+    """Get current simplification mode and available options."""
+    simp = get_simplification()
+    return {
+        "current_mode": simp["mode"],
+        "is_active": simp["mode"] != "none",
+        "modes": {
+            "none": {
+                "description": "Full functionality - all features enabled",
+                "enabled": simp["mode"] == "none",
+            },
+            "minimal": {
+                "description": "Core comparison only - no LLM, no reviews, no patches, no Q&A",
+                "enabled": simp["is_minimal"],
+                "blocks": ["LLM operations", "Human reviews", "Patch generation", "Q&A"],
+            },
+            "read_only": {
+                "description": "Disable all write operations - only GET requests allowed",
+                "enabled": simp["is_read_only"],
+                "blocks": ["POST /api/align", "POST /api/recheck", "POST /api/reviews", "POST /api/suggestions"],
+            },
+            "single_language": {
+                "description": f"Focus on one language only ({simp['single_language']}) - no cross-language comparison",
+                "enabled": simp["is_single_language"],
+                "current_language": simp.get("single_language", "en"),
+                "blocks": ["Cross-language alignment", "Multi-language comparison"],
+            },
+            "deterministic": {
+                "description": "Use only deterministic verdicts - skip LLM layer entirely",
+                "enabled": simp["is_deterministic"],
+                "blocks": ["LLM verdict grading"],
+                "uses": ["Deterministic layer only (dates, numbers, exact matches)"],
+            },
+            "no_extension": {
+                "description": "Remove all browser extension functionality",
+                "enabled": simp["is_no_extension"],
+                "blocks": ["Extension badge endpoint", "Extension resolver"],
+            },
+        },
+        "environment": {
+            "SIMPLIFICATION_MODE": settings.simplification_mode.value,
+            "SINGLE_LANGUAGE": settings.single_language,
+        },
+    }
+
+
+@app.post("/api/simplification")
+def set_simplification_config(toggle: SimplificationToggle):
+    """Toggle simplification mode. Requires restart to take full effect.
+    
+    This endpoint updates the in-memory settings. For persistent changes,
+    set the SIMPLIFICATION_MODE environment variable and restart the server.
+    """
+    from config import SimplificationMode
+    
+    if toggle.mode not in [m.value for m in SimplificationMode]:
+        raise HTTPException(
+            422,
+            f"Invalid mode: {toggle.mode}. Valid modes: {[m.value for m in SimplificationMode]}"
+        )
+    
+    # Update settings
+    settings.simplification_mode = SimplificationMode(toggle.mode)
+    if toggle.single_language:
+        settings.single_language = toggle.single_language
+    
+    return {
+        "status": "ok",
+        "message": f"Simplification mode set to '{toggle.mode}'. Some changes require server restart.",
+        "current_config": get_simplification(),
+    }
+
+
+@app.get("/api/simplification/options")
+def get_simplification_options():
+    """Get detailed information about each simplification mode."""
+    return {
+        "options": [
+            {
+                "id": "none",
+                "name": "Full Mode",
+                "description": "All features enabled. Complete cross-language Wikipedia comparison with LLM support, human review, patch generation, and browser extension.",
+                "pro hathath": ["All features available", "Best for development", "Complete demo experience"],
+                "cons": ["Complex", "Resource-intensive", "Slower (LLM calls)"],
+                "best_for": "Development, full demo, production",
+            },
+            {
+                "id": "minimal",
+                "name": "Minimal Mode",
+                "description": "Core comparison only. Strips away LLM, reviews, patches, and Q&A to focus on the essential page-to-page comparison.",
+                "pros": ["Fast", "Simple", "Low resource usage", "Easy to debug"],
+                "cons": ["No human review", "No patch export", "No Q&A", "No LLM verdicts"],
+                "blocks": ["LLM endpoints", "Review system", "Patch generation", "Q&A"],
+                "best_for": "Testing core comparison logic, debugging alignment",
+            },
+            {
+                "id": "read_only",
+                "name": "Read-Only Mode", 
+                "description": "Public demo mode. Allows viewing data but blocks any modifications. Perfect for presentations where you don't want accidental changes.",
+                "pros": ["Safe for public demos", "Prevents accidental data modification", "Full read access"],
+                "cons": ["No rechecks", "No reviews", "No alignment runs", "No exports"],
+                "blocks": ["All POST endpoints"],
+                "best_for": "Public demos, presentations, read-only deployments",
+            },
+            {
+                "id": "single_language",
+                "name": "Single-Language Mode",
+                "description": "Focus on one language edition only. Disables cross-language comparison and shows only the selected language's data.",
+                "pros": ["Simpler data model", "Faster queries", "Easier to understand", "Reduced complexity"],
+                "cons": ["No cross-language matching", "Loses the main value proposition", "No comparison view"],
+                "blocks": ["Cross-language alignment", "Multi-language comparison", "Interlanguage links"],
+                "configurable": True,
+                "config": ["single_language: fi|sv|en"],
+                "best_for": "Language-specific analysis, debugging single-language extraction",
+            },
+            {
+                "id": "deterministic",
+                "name": "Deterministic Mode",
+                "description": "Skip the LLM layer entirely. Uses only fast deterministic comparison for verdicts (exact matches, date/number comparisons).",
+                "pros": ["Fast", "Deterministic results", "No LLM dependency", "No API costs", "Reproducible"],
+                "cons": ["Less accurate for complex claims", "No cross-language entailment", "More false positives/negatives"],
+                "blocks": ["LLM verdict layer"],
+                "uses": ["Deterministic layer (exact matches, date comparison, number comparison)"],
+                "best_for": "Offline use, environments without LLM access, testing deterministic logic",
+            },
+            {
+                "id": "no_extension",
+                "name": "No-Extension Mode",
+                "description": "Remove all browser extension-specific functionality. Useful when deploying without the extension.",
+                "pros": ["Reduced attack surface", "Cleaner API", "No extension dependencies"],
+                "cons": ["Browser extension won't work", "Losing a key integration point"],
+                "blocks": ["Extension badge endpoint", "Extension resolver endpoint"],
+                "best_for": "Server-only deployments, API-only use, headless environments",
+            },
+        ],
+    }

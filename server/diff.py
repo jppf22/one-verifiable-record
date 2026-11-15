@@ -23,6 +23,7 @@ Row status, relative to this page:
 import consensus
 from db import query
 from pages import counterparts, get_page, in_list, revision_url
+from config import get_simplification
 
 STATUSES = ("conflict", "possible_conflict", "missing_here", "only_here", "possible_match", "agree")
 STATUS_ORDER = {s: i for i, s in enumerate(STATUSES)}
@@ -248,19 +249,44 @@ def summarize(rows) -> dict:
 
 
 def build_comparison(page_id: int, with_reviews: bool = True, page=None, cps=None):
-    """GET /pages/{id}/compare. Returns None if the page does not exist."""
+    """GET /pages/{id}/compare. Returns None if the page does not exist.
+    
+    In single_language mode, filters claims and links to only the configured language.
+    """
     page = page or get_page(page_id)
     if not page:
         return None
     cps = counterparts(page_id) if cps is None else cps
+    
+    # Check if single_language mode is active
+    simp = get_simplification()
+    single_lang = simp.get("single_language") if simp["is_single_language"] else None
+    
+    # In single_language mode, filter counterparts to only the configured language
+    if single_lang and simp["is_single_language"]:
+        cps = [p for p in cps if p["lang"] == single_lang]
+        # If the page itself is not in the target language, return empty
+        if page["lang"] != single_lang:
+            return {"page": page, "counterparts": [], "summary": summarize([]), "rows": []}
+    
     ids = [page_id] + [p["id"] for p in cps]
     if not cps:
         return {"page": page, "counterparts": [], "summary": summarize([]), "rows": []}
 
     claims = _fetch_claims(ids)
+    
+    # Filter claims by language in single_language mode
+    if single_lang and simp["is_single_language"]:
+        claims = [c for c in claims if c["lang"] == single_lang]
+    
     for c in claims:
         c["url"] = revision_url(c["lang"], c["revision_id"])
     links = _fetch_links(ids)
+    
+    # In single_language mode, there are no cross-language links
+    if single_lang and simp["is_single_language"]:
+        links = []
+    
     reviews = _fetch_latest_reviews([l["id"] for l in links]) if with_reviews and links else {}
     # R1 tally (consensus.py), only for links that have a review
     tallies = consensus.tallies(list(reviews)) if reviews else {}
@@ -281,7 +307,17 @@ def build_comparison(page_id: int, with_reviews: bool = True, page=None, cps=Non
     stats: dict = {}
     rows = build_rows(page_id, claims, links, stats)
     summary = {**summarize(rows), "links_hidden": stats.get("hidden", 0)}
-    return {"page": page, "counterparts": cps, "summary": summary, "rows": rows}
+    
+    # Add simplification mode info to response
+    result = {"page": page, "counterparts": cps, "summary": summary, "rows": rows}
+    if simp["is_single_language"]:
+        result["simplification"] = {
+            "mode": "single_language",
+            "language": single_lang,
+            "message": f"Showing only {single_lang} language claims"
+        }
+    
+    return result
 
 
 def page_summary(page_id: int) -> dict:

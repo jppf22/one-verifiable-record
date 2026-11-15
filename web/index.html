@@ -16,6 +16,22 @@
       <p class="tagline">The cross-language Wikipedia consistency desk</p>
     </div>
     <div class="account-area"><div id="reviewer-slot"></div></div>
+    <div class="simplification-toggle" id="simplification-toggle" hidden>
+      <button id="simp-toggle-btn" class="simp-btn" title="Toggle simplification modes">
+        <span class="simp-icon">⚙️</span>
+        <span class="simp-label">Simplify</span>
+      </button>
+      <div id="simp-menu" class="simp-menu" hidden>
+        <div class="simp-header">
+          <strong>Codebase Simplifications</strong>
+          <span class="simp-hint">Toggle to reduce complexity</span>
+        </div>
+        <div class="simp-options" id="simp-options"></div>
+        <div class="simp-footer">
+          <small>Changes require server restart</small>
+        </div>
+      </div>
+    </div>
     <form id="search-form" role="search">
       <label class="sr-only" for="search-input">Search imported Wikipedia articles</label>
       <div class="search-box">

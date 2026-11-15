@@ -11,6 +11,7 @@ import * as keyboard from "./keyboard.js";
 import * as history from "./history.js";
 import * as suggestions from "./suggestions.js";
 import * as qa from "./qa.js";
+import * as simplification from "./simplification.js";
 
 function renderReviewer() {
   const name = getReviewer();
@@ -73,5 +74,6 @@ safeInit("keyboard", keyboard);
 safeInit("history", history);
 safeInit("suggestions", suggestions);
 safeInit("qa", qa);
+safeInit("simplification", simplification);
 router.onRoute(showRoute);
 router.start();

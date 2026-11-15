@@ -5,13 +5,17 @@
 
 Every UPDATE to claim_links writes a new row version (SYSTEM VERSIONING), so
 the full evolution of every verdict stays queryable in SQL.
+
+SIMPLIFICATION MODES:
+- deterministic: Skip LLM layer entirely, use only deterministic verdicts
+- minimal: Skip LLM layer (as part of minimal mode)
 """
 import json
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
-from config import settings
+from config import settings, get_simplification
 from db import execute, placeholders, query
 
 NUMERIC_TOLERANCE = 1e-9
@@ -61,7 +65,15 @@ def llm_verdict(a: dict, b: dict):
     The prompt asks for one of: supported / contradicted / unverifiable /
     definition_mismatch (the last one covers false positives where two
     languages use the same name for different concepts).
+    
+    Respects simplification modes that disable LLM calls.
     """
+    simp = get_simplification()
+    
+    # Skip LLM in deterministic or minimal modes
+    if simp["is_deterministic"] or simp["is_minimal"]:
+        return "unverifiable", "LLM disabled in simplified mode"
+    
     if not settings.verda_api_key:
         return "unverifiable", "no LLM configured (set VERDA_API_KEY)"
     messages = [
@@ -148,7 +160,23 @@ def fetch_pairs_by_ids(link_ids) -> list:
 
 
 def grade_pair(a: dict, b: dict):
-    """Grade one claim pair, cheapest layer first -> (verdict, source, rationale)."""
+    """Grade one claim pair, cheapest layer first -> (verdict, source, rationale).
+    
+    Respects simplification modes:
+    - deterministic mode: Only use deterministic layer, return 'unverifiable' if no match
+    - minimal mode: Same as deterministic (no LLM)
+    """
+    simp = get_simplification()
+    
+    # In deterministic or minimal mode, skip LLM entirely
+    if simp["is_deterministic"] or simp["is_minimal"]:
+        det = deterministic_verdict(a, b)
+        if det:
+            return det, "deterministic", "canonical value comparison (simplified mode)"
+        # No deterministic verdict - mark as unverifiable (no LLM fallback)
+        return "unverifiable", "deterministic-only", "No deterministic match, LLM disabled in simplified mode"
+    
+    # Normal mode: try deterministic first, then LLM
     det = deterministic_verdict(a, b)
     if det:
         return det, "deterministic", "canonical value comparison"

@@ -63,4 +63,11 @@ export const api = {
     const qs = p.toString();
     return request(`/review/queue${qs ? `?${qs}` : ''}`);
   },
+  /** Get current simplification configuration. */
+  simplification: () => request('/simplification'),
+  /** Get simplification options. */
+  simplificationOptions: () => request('/simplification/options'),
+  /** Set simplification mode. */
+  setSimplification: (mode, singleLanguage = null) =>
+    request('/simplification', { method: 'POST', body: { mode, single_language: singleLanguage } }),
 };
