@@ -16,6 +16,10 @@ OpenAI-compatible `/v1` URL — a local model or a hosted API key.
 
 ## Steps
 
+Shortcut: the root `Makefile` wraps these steps (`make help`) — e.g.
+`make up-llm`, `make data-small`, `make import`, `make pipeline`,
+`make align PAGE=<id>`, `make check`. The raw commands are below.
+
 1. Requirements: Docker with the compose plugin. For the optional local GPU
    embedder, the NVIDIA container toolkit.
 2. `cp .env.example .env` and adjust:
