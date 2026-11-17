@@ -21,6 +21,7 @@ binding (new opposing votes) gets its machine verdict back. Only real changes ar
 written, so every row in the link's SVT history is a meaningful step.
 """
 from db import execute, placeholders, query, query_one
+import federation
 from verdicts import HUMAN_DECISION_VERDICT, SOURCE_HUMAN
 
 CONFIRM_QUORUM = 2
@@ -76,10 +77,12 @@ def decide(votes: list, subject: str | None) -> dict:
             reason = None
         r = role(v["decision"], v.get("subject_at_vote") or subject or "")
         if reason is None:
+            # Federated votes weigh the origin instance's trust_weight (1.0 local)
+            w = float(v.get("weight") or 1.0)
             if r == "confirm":
-                confirm += 1
+                confirm += w
             else:
-                oppose += 1
+                oppose += w
                 opposing.append(v)
         out.append({**v, "role": r, "counted": reason is None, "stale_reason": reason})
 
@@ -134,6 +137,7 @@ def tallies(link_ids) -> dict:
     )
     if not reviews:
         return {}
+    weights = federation.vote_weights([r["reviewer"] for r in reviews])
     reviewed = sorted({r["claim_link_id"] for r in reviews})
     versions = query(
         f"""SELECT id, claim_a, claim_b, verdict, verdict_source, ROW_START, ROW_END
@@ -168,6 +172,7 @@ def tallies(link_ids) -> dict:
                 "decision": r["decision"], "note": r["note"], "cast_at": r["cast_at"],
                 "subject_at_vote": at["verdict"] if at else None,
                 "claim_changed": changed_at is not None and changed_at > r["cast_at"],
+                "weight": weights.get(str(r["reviewer"]).split(":", 1)[0], 1.0),
             })
         t = decide(votes, subject)
         t["current_verdict"] = current["verdict"]

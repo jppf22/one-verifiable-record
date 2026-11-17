@@ -56,7 +56,10 @@ being viewed. The UI must therefore report one of these states:
 
 Agree on these points before starting browser work:
 
-- **Initial coverage:** `fi`, `sv`, and `en`; article namespace only.
+- **Initial coverage:** the manifest matches every `*.wikipedia.org` edition;
+  eligibility (imported page with counterparts) is decided server-side per
+  language, so editions not yet in the dataset stay silent. Article namespace
+  only.
 - **Primary interaction:** a small status indicator under the article heading.
 - **Detailed interaction:** initially open the existing standalone comparison
   view; later, optionally render a Chromium Side Panel with a concise summary.

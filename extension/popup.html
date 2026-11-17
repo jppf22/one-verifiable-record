@@ -97,43 +97,43 @@
 </head>
 <body>
   <header>
-    <h1>One Verifiable Record</h1>
-    <p>Cross-language Wikipedia consistency companion (fi · sv · en)</p>
+    <h1 data-i18n="appName"></h1>
+    <p data-i18n="subtitle"></p>
   </header>
 
-  <label class="field">API base URL (FastAPI or web proxy)
-    <input type="text" id="apiBase" placeholder="http://localhost:8000">
+  <label class="field"><span data-i18n="apiBaseLabel"></span>
+    <input type="text" id="apiBase" data-i18n-placeholder="apiBasePlaceholder" placeholder="http://localhost:8000">
   </label>
 
-  <label class="field">Web app URL (comparison view)
-    <input type="text" id="webBase" placeholder="http://localhost:8080">
+  <label class="field"><span data-i18n="webBaseLabel"></span>
+    <input type="text" id="webBase" data-i18n-placeholder="webBasePlaceholder" placeholder="http://localhost:8080">
   </label>
 
   <div class="toggles">
     <label class="toggle-row">
       <input type="checkbox" id="enabled">
-      <span>Show badge on tracked Wikipedia pages</span>
+      <span data-i18n="enabledLabel"></span>
     </label>
     <label class="toggle-row">
       <input type="checkbox" id="inlineFindings">
-      <span>Show inline claim highlights (matching snapshots)</span>
+      <span data-i18n="inlineLabel"></span>
     </label>
   </div>
 
   <div class="section-head">
-    <span>Filter inline claim types</span>
-    <button type="button" id="clearKinds" class="link-btn" hidden>Show all types</button>
+    <span data-i18n="filterHead"></span>
+    <button type="button" id="clearKinds" class="link-btn" data-i18n="showAll" hidden>Show all types</button>
   </div>
   <div id="kindFilters" class="chips" role="group" aria-label="Filter inline claim types"></div>
-  <p class="hint">Empty selection paints all claim types.</p>
+  <p class="hint" data-i18n="filterHint"></p>
 
   <div class="actions">
-    <a id="openWeb" class="app-link" href="http://localhost:8080" target="_blank" rel="noopener">Open comparison app ↗</a>
-    <button type="button" id="save" class="primary">Save</button>
+    <a id="openWeb" class="app-link" href="http://localhost:8080" target="_blank" rel="noopener" data-i18n="openApp"></a>
+    <button type="button" id="save" class="primary" data-i18n="save"></button>
   </div>
 
   <div id="status" role="status" aria-live="polite"></div>
-  <p class="note">Findings come from the imported snapshot revision and never edit Wikipedia.</p>
+  <p class="note" data-i18n="note"></p>
 
   <script src="popup.js"></script>
 </body>

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python syntax check
+        run: python -m compileall -q server jobs db/load embedder
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: JavaScript syntax check
+        run: |
+          for f in extension/*.js web/js/*.js; do
+            node --check "$f" || exit 1
+          done
+
+      - name: JSON validation
+        run: |
+          for f in extension/manifest.json extension/_locales/*/messages.json; do
+            jq -e . "$f" > /dev/null || exit 1
+          done
+
+      - name: SQL sanity check
+        run: |
+          for f in db/schema.sql db/migrations/*.sql; do
+            grep -qi "CREATE TABLE\|ALTER TABLE" "$f" || true
+          done
+          python3 - <<'EOF'
+          import re, pathlib
+          for f in list(pathlib.Path("db").rglob("*.sql")):
+              text = f.read_text()
+              assert text.count("(") == text.count(")"), f"unbalanced parens in {f}"
+          print("sql files: balanced parens OK")
+          EOF

@@ -71,8 +71,8 @@ def split_chunks(text: str):
             continue
         for piece in _split_long_paragraph(para):
             if cur and n + len(piece) > TARGET_CHUNK_CHARS:
-            parts.append(cur.strip())
-            cur, n = "", 0
+                parts.append(cur.strip())
+                cur, n = "", 0
             cur += piece + "\n\n"
             n += len(piece) + 2
     if cur.strip():
@@ -179,12 +179,13 @@ def main():
     ap.add_argument("--data-dir", default="db/load/data")
     ap.add_argument("--size", default="small", choices=["small", "medium", "large"],
                     help="dataset preset; used only for progress reporting so far")
-    ap.add_argument("--langs", default="fi,sv,en", help="comma-separated languages to import")
+    ap.add_argument("--langs", default="",
+                    help="comma-separated language editions to import; empty = every edition found in --data-dir")
     ap.add_argument("--only-shared", action="store_true",
                     help="only import articles whose Wikidata QID exists in 2+ selected languages "
                          "(the merge view needs at least two editions)")
     args = ap.parse_args()
-    langs = set(args.langs.split(","))
+    langs = set(args.langs.split(",")) if args.langs else None
 
     shared = None
     if args.only_shared:

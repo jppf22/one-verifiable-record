@@ -50,6 +50,21 @@ class Settings(BaseSettings):
     # browser writes without putting a costly LLM endpoint directly on port 8000.
     post_rate_limit_per_minute: int = 12
 
+    # Page counterpart resolution: minimum page_links confidence (pages.py).
+    counterpart_min_confidence: float = 0.5
+
+    # Federation / self-hosting (docs/federation.md). When enabled, this
+    # instance signs its /api/discoveries/feed records and can pull peer feeds.
+    federation_enabled: bool = False
+    instance_name: str = "local"
+    # PEM-encoded ed25519 private key; an ephemeral key is generated when empty.
+    instance_private_key: str = ""
+    # Hex ed25519 public key; derived from the private key when empty.
+    instance_public_key: str = ""
+    # Default pull remote when no `instances` rows exist, e.g. https://ovr.example.org
+    canonical_instance_url: str = ""
+    discovery_sync_interval_sec: int = 3600
+
     # ========================================================================
     # SIMPLIFICATION MODES
     # ========================================================================

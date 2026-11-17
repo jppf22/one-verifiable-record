@@ -6,7 +6,8 @@ Junction 2026 · MariaDB challenge #307 ("Wikipedia Through Time")
 > Wikipedia's language editions are parallel branches of the same truth.
 > **One Verifiable Record is the merge tool.**
 
-Pick an article. We decompose every imported source chunk in its fi / sv / en editions into
+Pick an article. We decompose every imported source chunk in its language editions
+(fi / sv / en in the initial dataset; any edition can be imported with `--langs`) into
 **atomic claims**, align them across languages with multilingual embeddings inside MariaDB, and
 render a **git-diff-style merge view**:
 what the editions agree on, where they contradict each other, and what one edition simply does not
@@ -23,7 +24,7 @@ link back into Wikipedia.
 | Grounded Q&A (RAG track) | The same vector index over article chunks; answers cite per-language sources |
 | Human-in-the-loop review | Review console to confirm/fix verdicts; every decision is itself versioned |
 | Patch generation | Per-language proposed wikitext edits / talk-page drafts, one-click export (never automated editing) |
-| Wikipedia companion extension | Manifest V3 consistency badge + deep links on live Wikipedia articles |
+| Wikipedia companion extension | Manifest V3 consistency badge + inline claim highlights + deep links on live articles of any `*.wikipedia.org` edition |
 
 ## Architecture
 
@@ -56,6 +57,7 @@ docker compose up --build     # MariaDB + API + web
 ./db/load/download_datasets.sh small
 pip install -r db/load/requirements.txt
 python db/load/import_dump.py --data-dir db/load/data --only-shared
+# import more editions: --langs fi,sv,en,de,fr  (empty --langs imports every edition found)
 
 pip install -r jobs/requirements.txt
 python jobs/embed.py --tables chunks  # CPU is fine for the small dataset
@@ -110,6 +112,29 @@ before importing:
 docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/001_live_refresh.sql
 docker compose exec -T mariadb sh -lc 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" wikipedia' < db/migrations/002_open_claim_taxonomy.sql
 ```
+
+## Free, open source, and self-hostable
+
+- **Code is MIT-licensed; content-derived data is CC BY-SA 4.0.** Claims, chunks,
+  receipts, and patch drafts derive from Wikipedia text, so any export of that
+  data must be attributed and shared alike — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+- **Self-host the whole stack** with `docker compose up --build` (see Quick start);
+  point the extension's "API base URL" setting at your own instance. Community
+  hosting on [Toolforge](https://toolforge.org) is the intended public path.
+- **Federated discoveries.** Self-hosted instances can share human reviews and
+  conflict resolutions through signed, content-addressed feeds, so nobody has
+  to redo the same review: enable `FEDERATION_ENABLED` and run
+  `jobs/sync_discoveries.py` on a cron. Details in [docs/federation.md](docs/federation.md).
+- **Browser extension for everyone.** The extension matches all
+  `*.wikipedia.org` editions (eligibility is decided server-side, so unimported
+  editions stay silent), is localized (en/fi/sv initially, more via
+  `_locales/`), and is built to be published to the Chrome Web Store, Edge
+  Add-ons, and Firefox AMO. Load it unpacked from `extension/` for development.
+- **Accessibility.** The UI uses semantic controls, keyboard navigation, focus
+  states, and text labels in addition to color; see
+  [docs/browser-extension-roadmap.md](docs/browser-extension-roadmap.md).
+- Community files: [CONTRIBUTING.md](CONTRIBUTING.md),
+  [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md).
 
 ## Repository layout
 

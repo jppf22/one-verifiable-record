@@ -14,7 +14,7 @@ USE wikipedia;
 -- ----------------------------------------------------------------------------
 CREATE TABLE articles (
   id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  lang          CHAR(2) NOT NULL COMMENT 'fi | sv | en',
+  lang          VARCHAR(10) NOT NULL COMMENT 'language edition code, e.g. fi | sv | en | ceb',
   page_id       BIGINT UNSIGNED NOT NULL,
   title         VARCHAR(512) NOT NULL,
   wikidata_qid  VARCHAR(16) NULL COMMENT 'e.g. Q9080; NULL if not linked to Wikidata',
@@ -215,6 +215,61 @@ CREATE TABLE resolutions (
   CONSTRAINT fk_res_link FOREIGN KEY (claim_link_id) REFERENCES claim_links (id)
 ) ENGINE=InnoDB
 WITH SYSTEM VERSIONING;
+
+-- ----------------------------------------------------------------------------
+-- dataset_versions: content identity of an imported snapshot + pipeline run.
+-- Federation records (reviews/resolutions) are only portable between instances
+-- that imported the same dataset version; see docs/federation.md.
+-- ----------------------------------------------------------------------------
+CREATE TABLE dataset_versions (
+  id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  dataset_hash     CHAR(64) NOT NULL COMMENT 'sha256 over the imported (lang, page_id, revision_id) set',
+  extractor_model  VARCHAR(128) NULL,
+  embedding_model  VARCHAR(128) NULL,
+  pipeline_version VARCHAR(64) NULL,
+  created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_dataset (dataset_hash)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- instances: known federation peers. A row's pubkey verifies the signatures on
+-- that instance's /api/discoveries/feed records; trust_weight scales its votes
+-- in consensus.py (local reviews always weigh 1.0).
+-- ----------------------------------------------------------------------------
+CREATE TABLE instances (
+  id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name          VARCHAR(64) NOT NULL,
+  base_url      VARCHAR(512) NOT NULL DEFAULT '',
+  pubkey        VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'hex ed25519 public key of the feed signer',
+  trust_weight  FLOAT NOT NULL DEFAULT 1.0,
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_instance_name (name)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- discovery_imports: idempotency ledger for federated sync. One row per
+-- (origin instance, record) ever imported, so re-pulling a feed never
+-- duplicates a vote.
+-- ----------------------------------------------------------------------------
+CREATE TABLE discovery_imports (
+  origin_instance  VARCHAR(64) NOT NULL,
+  record_type      ENUM('review','resolution') NOT NULL,
+  origin_record_id BIGINT UNSIGNED NOT NULL,
+  local_table      VARCHAR(32) NOT NULL,
+  local_id         BIGINT UNSIGNED NOT NULL,
+  imported_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (origin_instance, record_type, origin_record_id)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- discovery_sync_state: per-remote cursor (last feed record id pulled).
+-- ----------------------------------------------------------------------------
+CREATE TABLE discovery_sync_state (
+  instance_name   VARCHAR(64) NOT NULL PRIMARY KEY,
+  last_record_id  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  last_sync_at    TIMESTAMP NULL,
+  status          VARCHAR(32) NOT NULL DEFAULT 'pending'
+) ENGINE=InnoDB;
 
 -- ============================================================================
 -- Provenance query examples (the SVT demo):

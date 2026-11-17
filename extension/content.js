@@ -5,7 +5,17 @@
   const ROOT = "ovr-extension-root";
   const MARKERS = "ovr-extension-markers";
   const STYLE = "ovr-extension-highlights";
-  const LANGS = new Set(["fi", "sv", "en"]);
+  const t = (key, fallback) => {
+    try {
+      return chrome.i18n.getMessage(key) || fallback;
+    } catch (_) {
+      return fallback;
+    }
+  };
+  function langFromHost(hostname) {
+    const m = /^([a-z][a-z0-9-]{1,7})\.wikipedia\.org$/.exec(hostname.toLowerCase());
+    return m && m[1] !== "www" ? m[1] : null;
+  }
   const NAMES = [
     "ovr-conflict",
     "ovr-possible-conflict",
@@ -77,11 +87,12 @@
     missing_here: "Not on this page",
   };
 
-  const label = (s) => STATUS_LABELS[s] || "Finding";
+  const label = (s) => t("status_" + s, STATUS_LABELS[s] || "Finding");
   const kindKey = (k) => String(k || "factoid").trim().toLowerCase() || "factoid";
   const kindLabel = (k) => {
     const key = kindKey(k);
-    if (KIND_LABELS[key]) return KIND_LABELS[key];
+    const msg = t("kind_" + key, KIND_LABELS[key] || "");
+    if (msg) return msg;
     const s = key.replace(/_/g, " ").trim();
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Fact";
   };
@@ -188,8 +199,8 @@
   function candidate() {
     let url;
     try { url = new URL(location.href); } catch (_) { return null; }
-    const lang = url.hostname.split(".")[0].toLowerCase();
-    if (!LANGS.has(lang) || url.hostname.toLowerCase() !== `${lang}.wikipedia.org`) return null;
+    const lang = langFromHost(url.hostname);
+    if (!lang) return null;
     if (!url.pathname.startsWith("/wiki/") && url.pathname !== "/w/index.php") return null;
 
     // Exclude diffs, edit screens, history views, and VisualEditor views.
@@ -1160,7 +1171,7 @@
               <div class="finding-head">
                 <b>${esc(label(item.status))}</b>
                 <span class="muted">· ${esc(predText)}</span>
-                <span class="anchor-pill ${esc(item.anchorState)}">${esc(ANCHOR_LABELS[item.anchorState] || item.anchorState)}</span>
+                <span class="anchor-pill ${esc(item.anchorState)}">${esc(t("anchor_" + item.anchorState, ANCHOR_LABELS[item.anchorState] || item.anchorState))}</span>
               </div>
               <div>${esc(snippet)}</div>
             `;

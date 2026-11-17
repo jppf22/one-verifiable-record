@@ -6,6 +6,21 @@ const defaults = {
   selectedKinds: [],
 };
 
+function applyI18n() {
+  document.documentElement.lang = chrome.i18n.getUILanguage();
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    const msg = chrome.i18n.getMessage(el.dataset.i18n);
+    if (msg) el.textContent = msg;
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    const msg = chrome.i18n.getMessage(el.dataset.i18nPlaceholder);
+    if (msg) el.placeholder = msg;
+  });
+  const title = chrome.i18n.getMessage("appName");
+  if (title) document.title = title;
+}
+applyI18n();
+
 const BASE_KINDS = ["date", "number", "quantity", "entity_relation", "factoid"];
 const KIND_LABELS = {
   date: "Date",
@@ -33,6 +48,8 @@ function kindKey(k) {
 
 function kindLabel(k) {
   const key = kindKey(k);
+  const msg = chrome.i18n.getMessage("kind_" + key);
+  if (msg) return msg;
   if (KIND_LABELS[key]) return KIND_LABELS[key];
   const s = key.replace(/_/g, " ").trim();
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Fact";

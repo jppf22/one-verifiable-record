@@ -6,7 +6,7 @@ All other AGENTS.md files inherit from and may override these instructions.
 ## Project Identity
 
 **One Verifiable Record** is a Junction 2026 hackathon project (MariaDB Challenge #307: "Wikipedia Through Time").
-We treat Wikipedia's fi/sv/en language editions as parallel branches of the same truth and built a merge tool.
+We treat Wikipedia's language editions as parallel branches of the same truth and built a merge tool (fi/sv/en in the initial dataset; the loader, server and extension accept any edition).
 
 **Core Promise**: Cross-language Wikipedia fact-consistency with receipts.
 - Atomic claims extracted from each language edition

@@ -12,6 +12,11 @@ Endpoints (see /docs for the interactive reference):
                                            {"focus_link_ids": [...]}; reports which
                                            conflicts resurface
   GET  /api/badge?lang&title               extension summary badge (+ conflicts, gaps)
+  GET  /api/extension/resolve              page-ID-first extension resolver (compact negative)
+  GET  /api/extension/annotations          read-only inline findings for the extension
+  GET  /api/discoveries/feed?since=        signed federation feed of reviews/resolutions
+  POST /api/discoveries/sync               pull peer feeds and import verified records
+  GET  /api/discoveries/status             federation + dataset version status
   GET  /api/claims/{id}/history            biography of a claim + its links and
                                            their reviews (FOR SYSTEM_TIME ALL)
   POST /api/reviews                        human-in-the-loop review, then re-check
@@ -38,6 +43,8 @@ from pydantic import BaseModel, Field
 import alignment
 import diff
 import embedding_jobs
+import federation
+import pages
 import patches
 import rag
 import recheck
@@ -67,6 +74,7 @@ WRITE_ENDPOINTS = [
     "/api/recheck",
     "/api/reviews",
     "/api/suggestions",
+    "/api/discoveries/sync",
 ]
 
 # Endpoints that use LLM - can be blocked in minimal/deterministic modes
@@ -81,6 +89,7 @@ LLM_ENDPOINTS = [
 EXTENSION_ENDPOINTS = [
     "/api/badge",
     "/api/extension/resolve",
+    "/api/extension/annotations",
 ]
 
 # Endpoints that involve reviews - can be blocked in minimal mode
@@ -463,6 +472,119 @@ def badge(lang: str, title: str):
         "conflicts": status["conflict"],
         "gaps": status["gap"],
     }
+
+
+def _extension_page(lang: str, title: str, wiki_page_id: Optional[int]):
+    """Stable identity first (MediaWiki page id), title only as fallback."""
+    page = pages.find_by_wiki_page_id(lang, wiki_page_id) if wiki_page_id else None
+    if page is None:
+        page = pages.find_by_title(lang, title)
+    return page
+
+
+def _freshness(analysed, live) -> str:
+    if live is None:
+        return "unknown"
+    return "current" if analysed == live else "stale"
+
+
+@app.get("/api/extension/resolve")
+def extension_resolve(lang: str, title: str, wiki_page_id: Optional[int] = None,
+                      live_revision_id: Optional[int] = None):
+    """Page-ID-first resolver for the browser extension (docs/browser-extension-roadmap.md).
+
+    Read-only: precomputed summary counts only, never alignment/LLM grading.
+    Untracked pages get a compact successful negative response.
+    """
+    page = _extension_page(lang, title, wiki_page_id)
+    if page is None:
+        return {"tracked": False, "reason": "not_imported"}
+    cps = pages.counterparts(page["id"])
+    if not cps:
+        return {"tracked": False, "reason": "no_counterparts"}
+    stats = pages.page_stats([page["id"]], cps={page["id"]: cps})[page["id"]]
+    analysed = page["revision_id"]
+    has_claims = query_one(
+        "SELECT 1 AS ok FROM claims c WHERE c.article_id = %s AND c.revision_id <=> %s LIMIT 1",
+        (page["id"], analysed),
+    )
+    return {
+        "tracked": True,
+        "page": page,
+        "counterparts": cps,
+        "analysed_revision_id": analysed,
+        "live_revision_id": live_revision_id,
+        "freshness": _freshness(analysed, live_revision_id),
+        "analysis_status": "ready" if has_claims else "not_ready",
+        **stats,
+    }
+
+
+@app.get("/api/extension/annotations")
+def extension_annotations(lang: str, title: str, wiki_page_id: Optional[int] = None,
+                          live_revision_id: Optional[int] = None):
+    """Read-only inline-finding projection of diff.build_comparison for the extension."""
+    page = _extension_page(lang, title, wiki_page_id)
+    if page is None:
+        return {"tracked": False, "reason": "not_imported"}
+    cps = pages.counterparts(page["id"])
+    view = diff.build_comparison(page["id"], with_reviews=False, page=page, cps=cps)
+    if view is None:
+        return {"tracked": False, "reason": "not_imported"}
+    annotations, missing = [], []
+    for row in view["rows"]:
+        here = row["here"][0] if row["here"] else None
+        counterparts = [
+            {"lang": lg, "text": c["statement_text"],
+             "value": c["value_normalized"] or c["value_text"],
+             "revision_id": c["revision_id"]}
+            for lg, claims in row["there"].items() for c in claims
+        ]
+        item = {
+            "row_key": row["key"],
+            "status": row["status"],
+            "kind": row["kind"],
+            "predicate": row["predicate"],
+            "claim": ({
+                "text": here["statement_text"],
+                "value": here["value_normalized"] or here["value_text"],
+                "context": here["context_text"],
+                "predicate": here["predicate"],
+            } if here else None),
+            "counterparts": counterparts,
+        }
+        (missing if row["status"] == "missing_here" else annotations).append(item)
+    has_claims = query_one(
+        "SELECT 1 AS ok FROM claims c WHERE c.article_id = %s AND c.revision_id <=> %s LIMIT 1",
+        (page["id"], page["revision_id"]),
+    )
+    return {
+        "tracked": True,
+        "page": page,
+        "counterparts": cps,
+        "freshness": _freshness(page["revision_id"], live_revision_id),
+        "analysis_status": "ready" if (has_claims or view["rows"]) else "not_ready",
+        "summary": view["summary"],
+        "annotations": annotations,
+        "missing_here": missing,
+    }
+
+
+@app.get("/api/discoveries/feed")
+def discoveries_feed(since: int = 0):
+    """Signed, append-only feed of local reviews + resolutions (docs/federation.md)."""
+    return federation.feed(since)
+
+
+@app.post("/api/discoveries/sync")
+def discoveries_sync():
+    """Pull peer discovery feeds and import new verified records."""
+    return federation.sync()
+
+
+@app.get("/api/discoveries/status")
+def discoveries_status():
+    return federation.status()
 
 
 @app.get("/api/claims/{claim_id}/history")

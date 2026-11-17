@@ -5,7 +5,7 @@ This file inherits from and refines the root `AGENTS.md` for `extension/`.
 
 ## Extension Overview
 
-Manifest V3 Chromium browser extension (`fi`, `sv`, and `en` Wikipedia companion).
+Manifest V3 Chromium browser extension (all `*.wikipedia.org` Wikipedia editions; eligibility is server-gated).
 Runs strictly on article views (`wgNamespaceNumber === 0`, `wgAction === "view"`) and provides:
 - Severity-colored heading badge (`#ovr-extension-root` Shadow DOM) + browser toolbar badge
 - Inline claim highlighting via the CSS Custom Highlight API (`CSS.highlights`)
@@ -30,8 +30,8 @@ extension/
 ## Constraints (Never Violate)
 
 1. **Manifest V3 only**: Service worker in `background.js`, no inline scripts in `popup.html`, no `eval()`.
-2. **Minimal permissions**: Only `"storage"` in `permissions`, `fi/sv/en.wikipedia.org` + `localhost`/`127.0.0.1` in `host_permissions`, and `"https://*/*"` in `optional_host_permissions` (requested only on explicit user save in `popup.js`).
-3. **Article-only scope on `fi`, `sv`, `en` Wikipedia**: Reject non-mainspace pages (`Special:`, `Talk:`, `Category:`, localized equivalents), edits, history views, and diffs before making any API call.
+2. **Minimal permissions**: Only `"storage"` in `permissions`, `https://*.wikipedia.org/*` + `localhost`/`127.0.0.1` in `host_permissions`, and `"https://*/*"` in `optional_host_permissions` (requested only on explicit user save in `popup.js`). UI strings come from `_locales/` (`default_locale: en`; fi/sv first, then more).
+3. **Article-only scope on all `*.wikipedia.org` editions**: Reject non-mainspace pages (RLCONF `wgNamespaceNumber !== 0` is the primary, language-agnostic check; the localized prefix list is only a fallback), edits, history views, and diffs before making any API call. The subdomain is parsed as the language code (`langFromHost`) and passed through; the API answers `tracked: false` for unimported editions.
 4. **Snapshot safety**: Inline highlights (`CSS.highlights`) and inline markers only render when `freshness === "current"` (live revision ID equals `analysed_revision_id`) and `analysis_status === "ready"`. Stale pages show precomputed summary counts and an `"Open analysed revision"` permalink without painting live text.
 5. **No Wikipedia editing**: Deep links (`#/page/{lang}/{title}?focus=r-...`, `&review=1`, `&panel=suggestions`) and `"Copy claim"` never modify or submit anything on Wikipedia.
 
