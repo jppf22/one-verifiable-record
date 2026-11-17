@@ -29,72 +29,80 @@ link back into Wikipedia.
 
 ```mermaid
 flowchart LR
-  subgraph cold["Cold path (run once, GPU instance)"]
+  subgraph cold["Cold path (this machine, run once)"]
     DS[Wikipedia datasets fi/sv/en] --> IMP["db/load import"] --> EMB["jobs/embed.py (multilingual-e5-large)"]
   end
-  subgraph hot["Hot path (one CPU VM on Verda)"]
+  subgraph hot["Hot path (local docker-compose)"]
     MARIA[("MariaDB 11.8: VECTOR + HNSW + SYSTEM VERSIONING")] <--> API["FastAPI: align / verdicts / diff / patches / RAG"]
     API --> WEB["Web merge view"]
     EXT["Wikipedia extension"] --> API
-    API --> LLM["Verda Inference API: entailment + synthesis"]
+    API --> LLM["Any OpenAI-compatible LLM (local or hosted): entailment + synthesis"]
   end
   EMB --> MARIA
 ```
 
-* **Hot path** (one Verda CPU VM, 4–8 vCPU, 16–32 GB RAM, NVMe): MariaDB + API + web via docker-compose.
-* **Cold path** (GPU instance, destroy after the run): the embedding job.
-* **LLM at query time**: Verda Inference API for cross-language entailment and RAG synthesis.
+* **Hot path** (local docker-compose): MariaDB + API + web, all on loopback by default.
+* **Cold path** (local, CPU or GPU): the embedding job, against the local `embedder` service or in-process.
+* **LLM at query time**: any OpenAI-compatible `/v1` endpoint — a locally deployed model
+  (Ollama via the `local-llm` compose profile, vLLM, LM Studio, llama.cpp) or a hosted API
+  key (OpenAI, OpenRouter, ...). Configure with `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`.
 
-See `docs/deploy-verda.md` for the full deployment runbook.
+See `docs/deploy-local.md` for the full local deployment runbook.
 
 ## Quick start
 
 ```bash
-cp .env.example .env          # adjust credentials / Verda API key
-docker compose up --build     # MariaDB + API + web
+cp .env.example .env          # MariaDB credentials + AI endpoints (all optional, see below)
+docker compose up --build -d  # MariaDB + API + web + local embedder
+
+# Optional local LLM (any OpenAI-compatible endpoint also works via LLM_BASE_URL):
+docker compose --profile local-llm up -d ollama
+docker compose exec ollama ollama pull qwen3:8b
+# .env: LLM_BASE_URL=http://ollama:11434/v1  LLM_MODEL=qwen3:8b
 
 ./db/load/download_datasets.sh small
 pip install -r db/load/requirements.txt
 python db/load/import_dump.py --data-dir db/load/data --only-shared
 
 pip install -r jobs/requirements.txt
-python jobs/embed.py --tables chunks  # CPU is fine for the small dataset
-python jobs/extract_claims.py --pilot 20
+python jobs/embed.py --tables chunks   # via the local embedder service (CPU is fine for small)
+python jobs/extract_claims.py --pilot 20   # LLM extraction; without an LLM use jobs/extract_rules.py
 python jobs/embed.py --tables claims
-curl -X POST localhost:8000/api/align/Q12345
+PAGE_ID=$(curl -s 'localhost:8000/api/pages?q=Finland' | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["page"]["id"])')
+curl -X POST localhost:8000/api/pages/$PAGE_ID/align
 ```
 
 Claim predicates are extractor-generated canonical relations, not an application
 allow-list. For existing data made with an older extractor, re-run extraction and
-embedding before interpreting coverage. For example, for a selected entity:
+embedding before interpreting coverage. For example, for selected topics:
 
 ```bash
-python jobs/extract_claims.py --qids Q12345 --replace-current
+python jobs/extract_claims.py --qids Q12345 --reextract
 python jobs/embed.py --tables claims
-curl -X POST localhost:8000/api/align/Q12345
+curl -X POST localhost:8000/api/pages/$PAGE_ID/align
 ```
 
-`--replace-current` is deliberately scoped to the selected QIDs and records the
+`--reextract` is deliberately scoped to the selected QIDs and records the
 prior system-versioned claim/link rows as history.
 
-### On-demand Verda GPU embeddings
+### On-demand embeddings for one page
 
-When `GPU_EMBED_BASE_URL` and `GPU_EMBED_TOKEN` point at the protected Verda
-worker, embed only the missing current claim vectors for one page:
+`EMBED_BASE_URL` points at any OpenAI-compatible `/v1/embeddings` endpoint — the
+local `embedder` service by default, a local GPU worker
+(`docker compose --profile gpu up -d embedder-gpu`, then
+`EMBED_BASE_URL=http://embedder-gpu:8002/v1`), or a hosted API. To embed only the
+missing current vectors for one page:
 
 ```bash
-# Run on the app VM (or use the public web origin's /api proxy).
-curl -X POST 'http://localhost:8000/api/embed/Q12345'
+curl -X POST 'http://localhost:8000/api/pages/$PAGE_ID/embed?include_chunks=true'
 ```
 
-Add `?include_chunks=true` after an import to embed the page's RAG passages as
-well. The API sends text batches to the GPU worker but writes vectors through
-the app VM's existing MariaDB connection, so MariaDB is never exposed on the
-GPU VM. The worker is intentionally QID-scoped and GPU-billed while running;
-stop it with `verda vm shutdown --id <gpu-worker-id>` when it is no longer
-needed.
+The API sends text batches to the embeddings endpoint but writes vectors through
+its own MariaDB connection, so MariaDB is never exposed to the embedding worker.
+The route is intentionally page-scoped: a browser cannot start a corpus-wide job.
 
 Open http://localhost:8080 (merge view) or http://localhost:8000/docs (API reference).
+`GET /api/health` reports which LLM/embeddings endpoints are configured.
 
 ### Refreshing a dataset snapshot
 
@@ -119,7 +127,7 @@ jobs/        GPU embedding pipeline (multilingual-e5-large)
 server/      FastAPI: claim alignment, verdict layers, diff engine, patches, RAG
 web/         Merge-view web app (static, served by nginx)
 extension/   Manifest V3 Wikipedia companion
-docs/        Verda deployment guide
+docs/        local deployment guide
 ```
 
 ## How this uses MariaDB (challenge criteria)

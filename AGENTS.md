@@ -20,7 +20,7 @@ We treat Wikipedia's fi/sv/en language editions as parallel branches of the same
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      HOT PATH (Verda CPU VM)                      │
+│                 HOT PATH (local docker-compose)                  │
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │  MariaDB 11.8                                               │  │
 │  │    - VECTOR(1024) columns + HNSW index                      │  │
@@ -56,11 +56,11 @@ We treat Wikipedia's fi/sv/en language editions as parallel branches of the same
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    COLD PATH (GPU Instance)                        │
+│                 COLD PATH (this machine: CPU or local GPU)       │
 │  - jobs/embed.py (multilingual-e5-large)                        │
 │  - jobs/extract_claims.py (LLM extraction)                     │
 │  - jobs/extract_rules.py (rules-based fallback)                 │
-│  - embedder/ (OpenAI-style API for embeddings)                  │
+│  - embedder/ (local OpenAI-style API for embeddings)            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -92,12 +92,15 @@ We treat Wikipedia's fi/sv/en language editions as parallel branches of the same
 - **Never submit** - Users must manually apply patches
 
 ### Deployment
-- **Target**: Verda cloud
-  - Hot path: CPU VM (4-8 vCPU, 16-32 GB RAM, NVMe)
-  - Cold path: GPU instance (destroy after embedding run)
-- **LLM**: Verda Inference API (`https://inference.verda.com/v1`)
-  - Model: `kimi-k3-1-pro`
-  - Note: `/v1/embeddings` not available, use `embedder/` container
+- **Target**: fully local, docker-compose (see `docs/deploy-local.md`)
+  - Hot path: `mariadb` + `server` + `web` services, loopback-only by default
+  - Cold path: `jobs/embed.py` on this machine (CPU, or local GPU via the `gpu` compose profile)
+- **AI inference**: any OpenAI-compatible `/v1` endpoint, local model or hosted API key
+  - Chat LLM: `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` (`OPENAI_*` aliases accepted);
+    local Ollama via `docker compose --profile local-llm up -d ollama`
+  - Embeddings: `EMBED_BASE_URL` / `EMBED_API_KEY` / `EMBED_MODEL`; default is the local `embedder/` container
+  - `LLM_EXTRA_BODY` (JSON) merges provider-specific params into every chat request
+  - Leave `LLM_BASE_URL`/`LLM_MODEL` empty to run LLM-free (deterministic verdicts; `jobs/extract_rules.py`)
 
 ## Data Model (Page-Centric v2)
 
@@ -125,7 +128,7 @@ The project switched from entity/QID-based to **page-based** comparison on 2026-
 
 **Two-layer grading**:
 1. Deterministic: Dates/numbers on value_normalized (exact match)
-2. LLM: Cross-language entailment (Verda Inference API)
+2. LLM: Cross-language entailment (configured OpenAI-compatible LLM)
 
 ### Status Model (Page-Centric)
 From the perspective of "this page" being viewed:
@@ -273,7 +276,7 @@ All endpoints return JSON. Errors use HTTP status codes:
 
 Key decisions already made:
 - D1: Embeddings in separate tables (chunk_embeddings, claim_embeddings) - NOT NULL, HNSW
-- D2: Claims extracted with LLM (Verda, Kimi K3.1 Pro) when available
+- D2: Claims extracted with the configured LLM (any OpenAI-compatible endpoint) when available
 - D3: Rules-based extraction (extract_rules.py) as fallback
 - V1-V6: Page-centric model (not entity/QID based)
 - A1-A6: Alignment and re-check behavior

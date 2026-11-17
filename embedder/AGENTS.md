@@ -7,7 +7,7 @@ This file overrides the root AGENTS.md for embedder-specific instructions.
 
 Local embedding service providing OpenAI-style `/v1/embeddings` endpoint using multilingual-e5-large.
 
-**Why it exists**: Verda's inference gateway has no embeddings endpoint, so we serve the model ourselves.
+**Why it exists**: embeddings run locally — this service serves the model ourselves over an OpenAI-compatible API (the default `EMBED_BASE_URL`); any other OpenAI-compatible `/v1/embeddings` endpoint also works.
 
 ### Directory Structure
 ```
@@ -231,10 +231,10 @@ curl http://localhost:8001/health
 ## Final Notes
 
 This is a simple but critical service. It:
-1. Provides embeddings when Verda gateway doesn't
+1. Provides embeddings locally (default EMBED_BASE_URL)
 2. Uses standard OpenAI API format for compatibility
 3. Handles E5 prefix requirements automatically
-4. Works with both CPU and GPU
+4. Works with both CPU (default service) and GPU (`gpu` compose profile)
 
 For production:
 - Use GPU instance for bulk embedding

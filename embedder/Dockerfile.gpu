@@ -1,6 +1,7 @@
-# CUDA runtime supplied by Verda's GPU host. SentenceTransformers installs a
+# CUDA runtime for a LOCAL GPU host (NVIDIA container toolkit). Run via the
+# "gpu" compose profile (embedder-gpu service); SentenceTransformers installs a
 # CUDA-enabled torch wheel from this image rather than the CPU-only base used
-# by the local development embedder.
+# by the default embedder.
 # Keep pace with the current Transformers package pulled by
 # sentence-transformers. Older CUDA PyTorch images fail while importing its
 # distributed helpers before the embedding model can load.

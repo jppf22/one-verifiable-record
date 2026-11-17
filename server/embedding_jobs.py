@@ -1,4 +1,11 @@
-"""QID-scoped embedding jobs dispatched to the configured embedding worker."""
+"""Page-scoped embedding jobs dispatched to the configured embeddings endpoint.
+
+The endpoint is any OpenAI-compatible ``/v1/embeddings`` service: by default the
+local ``embedder`` container from docker-compose (CPU, or a GPU-hosted copy via
+the ``gpu`` compose profile), but EMBED_BASE_URL/EMBED_API_KEY also accept a
+hosted API. Vectors are written through this server's own MariaDB connection,
+so the database is never exposed to the embedding worker.
+"""
 import math
 
 import httpx
@@ -7,6 +14,8 @@ from config import settings
 from db import get_conn, query
 
 BATCH_SIZE = 64
+# Must match VECTOR(1024) in db/schema.sql; a different EMBED_MODEL needs a
+# schema change, and the check below turns a mismatch into a clear error.
 EMBEDDING_DIMENSIONS = 1024
 
 
@@ -15,14 +24,14 @@ def _vec_literal(vector) -> str:
 
 
 def _worker_headers() -> dict:
-    return {"Authorization": f"Bearer {settings.gpu_embed_token}"} if settings.gpu_embed_token else {}
+    return {"Authorization": f"Bearer {settings.embed_api_key}"} if settings.embed_api_key else {}
 
 
 def _encode(texts: list[str], input_type: str) -> list[list[float]]:
-    if not settings.gpu_embed_base_url:
-        raise RuntimeError("GPU embedding worker is not configured")
+    if not settings.embed_base_url:
+        raise RuntimeError("no embeddings endpoint configured (set EMBED_BASE_URL)")
     response = httpx.post(
-        f"{settings.gpu_embed_base_url.rstrip('/')}/embeddings",
+        f"{settings.embed_base_url.rstrip('/')}/embeddings",
         headers=_worker_headers(),
         json={"model": settings.embed_model, "input": texts, "input_type": input_type},
         timeout=300,
@@ -31,15 +40,15 @@ def _encode(texts: list[str], input_type: str) -> list[list[float]]:
     try:
         data = response.json().get("data", [])
     except ValueError as exc:
-        raise RuntimeError("embedding worker returned invalid JSON") from exc
+        raise RuntimeError("embeddings endpoint returned invalid JSON") from exc
     if not isinstance(data, list) or len(data) != len(texts):
-        raise RuntimeError("embedding worker returned an incomplete batch")
+        raise RuntimeError("embeddings endpoint returned an incomplete batch")
     try:
         data = sorted(data, key=lambda item: item["index"])
     except (KeyError, TypeError) as exc:
-        raise RuntimeError("embedding worker returned malformed embedding metadata") from exc
+        raise RuntimeError("embeddings endpoint returned malformed embedding metadata") from exc
     if [item["index"] for item in data] != list(range(len(texts))):
-        raise RuntimeError("embedding worker returned invalid embedding indexes")
+        raise RuntimeError("embeddings endpoint returned invalid embedding indexes")
     vectors = [item.get("embedding") for item in data]
     if any(
         not isinstance(vector, list)
@@ -47,28 +56,31 @@ def _encode(texts: list[str], input_type: str) -> list[list[float]]:
         or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in vector)
         for vector in vectors
     ):
-        raise RuntimeError("embedding worker returned invalid embedding vectors")
+        raise RuntimeError(
+            f"embeddings endpoint returned invalid vectors (expected {EMBEDDING_DIMENSIONS} dims; "
+            "EMBED_MODEL must match the VECTOR column in db/schema.sql)"
+        )
     return vectors
 
 
-def _pending(qid: str, table: str) -> list[dict]:
+def _pending(page_id: int, table: str) -> list[dict]:
     if table == "claims":
         return query(
             """SELECT c.id, c.statement_text AS text FROM claims c
                JOIN articles a ON a.id = c.article_id
                LEFT JOIN claim_embeddings e ON e.claim_id = c.id
-               WHERE a.wikidata_qid = %s AND c.revision_id <=> a.revision_id
+               WHERE c.article_id = %s AND c.revision_id <=> a.revision_id
                  AND e.claim_id IS NULL ORDER BY c.id""",
-            (qid,),
+            (page_id,),
         )
     if table == "chunks":
         return query(
             """SELECT ch.id, ch.text FROM chunks ch
                JOIN articles a ON a.id = ch.article_id
                LEFT JOIN chunk_embeddings e ON e.chunk_id = ch.id
-               WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id
+               WHERE ch.article_id = %s AND ch.revision_id <=> a.revision_id
                  AND e.chunk_id IS NULL ORDER BY ch.id""",
-            (qid,),
+            (page_id,),
         )
     raise ValueError(f"unknown embedding table: {table}")
 
@@ -87,11 +99,11 @@ def _store(table: str, rows: list[dict], vectors: list[list[float]]) -> None:
         conn.commit()
 
 
-def embed_qid(qid: str, tables=("claims", "chunks")) -> dict:
-    """Embed only current, missing rows for one entity through the GPU worker."""
-    result = {"qid": qid, "worker": settings.gpu_embed_base_url, "embedded": {}}
+def embed_page(page_id: int, tables=("claims", "chunks")) -> dict:
+    """Embed only the page's current, missing rows via the embeddings endpoint."""
+    result = {"page_id": page_id, "endpoint": settings.embed_base_url, "embedded": {}}
     for table in tables:
-        rows = _pending(qid, table)
+        rows = _pending(page_id, table)
         for offset in range(0, len(rows), BATCH_SIZE):
             batch = rows[offset: offset + BATCH_SIZE]
             _store(table, batch, _encode([row["text"] or "" for row in batch], "query" if table == "claims" else "passage"))

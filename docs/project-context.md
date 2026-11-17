@@ -18,9 +18,10 @@ wiki link). Human-in-the-loop review is a core feature.
 - MariaDB is mandatory (challenge): vector search + system-versioned tables
   must be used creatively (judges score this, 20% each criterion).
 - Must run on the provided datasets at all three sizes (small/medium/large).
-- Hosting: Verda cloud (CPU VM for hot path: 4–8 vCPU, 16–32 GB RAM, NVMe;
-  GPU instance for batch embedding, destroy after; Verda Inference API for
-  LLM entailment at query time, Kimi K3.1 Pro).
+- Hosting: fully local via docker-compose (hot path: MariaDB + API + web;
+  cold path: embedding job on the local CPU/GPU). AI inference uses any
+  OpenAI-compatible `/v1` endpoint — local model or hosted API key
+  (`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`); see `docs/deploy-local.md`.
 - No automated Wikipedia editing (cross-wiki bot editing is prohibited by
   Wikipedia policy): suggestions are export-only patches.
 - Datasets: github.com/MariaDB/mariadb-wikipedia-datasets and
@@ -37,8 +38,9 @@ deterministic (dates/numbers on value_normalized) then LLM entailment.
 
 Effective/creative use of MariaDB RAG+SVT (20%), implementation/scalability
 across datasets (20%), real-world usefulness (20%), design/demo (20%),
-originality (20%); bonus for SVT or combined tracks. Verda runs a "Best use
-of Verda" bounty (€10k credits) for any team using Verda on any challenge.
+originality (20%); bonus for SVT or combined tracks. (The hackathon's Verda
+"Best use of Verda" bounty applied while the project was hosted on Verda; the
+project now runs fully locally.)
 
 ## 48h build order
 
@@ -59,7 +61,7 @@ complete. API server skeleton covers alignment (single-SQL vector matching),
 verdict layers, diff/merge engine, patch generation, RAG QA, badge endpoint
 for the extension. Web merge view + Manifest V3 extension are skeletons.
 TODO: dataset import format adaptation, claim extraction (chunks → claims),
-Verda endpoints confirmation (VERDA_BASE_URL), populating value_normalized.
+LLM endpoint confirmation (LLM_BASE_URL), populating value_normalized.
 
 ## Demo fallback
 

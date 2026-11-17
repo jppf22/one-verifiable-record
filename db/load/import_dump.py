@@ -71,8 +71,8 @@ def split_chunks(text: str):
             continue
         for piece in _split_long_paragraph(para):
             if cur and n + len(piece) > TARGET_CHUNK_CHARS:
-            parts.append(cur.strip())
-            cur, n = "", 0
+                parts.append(cur.strip())
+                cur, n = "", 0
             cur += piece + "\n\n"
             n += len(piece) + 2
     if cur.strip():

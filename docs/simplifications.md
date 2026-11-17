@@ -191,7 +191,7 @@ SIMPLIFICATION_MODE=deterministic
 
 **Use Cases:**
 - Offline use without LLM access
-- Environments without Verda Inference API
+- Environments without a configured LLM endpoint
 - Testing deterministic logic
 - Faster operation (no LLM network calls)
 - More predictable/reproducible results

@@ -25,10 +25,10 @@ jobs/
 ### Two Extraction Methods
 
 #### 1. LLM-based Extraction (extract_claims.py)
-- Uses Verda Inference API (kimi-k3-1-pro)
+- Uses any configured OpenAI-compatible chat LLM (`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`;
+  local Ollama/vLLM/LM Studio or a hosted API key)
 - Handles complex sentences and context
-- More accurate but slower and costly
-- **Current Status**: Not available (Verda project not subscribed to models)
+- More accurate but slower and needs a working LLM endpoint
 
 #### 2. Rules-based Extraction (extract_rules.py)
 - Uses regex patterns and heuristics
@@ -309,7 +309,7 @@ python jobs/embed.py --endpoint http://localhost:8001
 
 ### extract_claims.py
 - LLM-based claim extraction
-- Uses Verda Inference API
+- Uses the configured OpenAI-compatible LLM endpoint
 - More accurate but requires LLM access
 
 **Key Functions**:
@@ -371,8 +371,8 @@ python jobs/embed.py --endpoint http://localhost:8001
 ## Gotchas
 
 1. **LLM Not Available**: Falls back to rules-based extraction
-   - Check Verda project subscription
-   - Use rules-based as fallback
+   - Check LLM_BASE_URL / LLM_MODEL are set and reachable
+   - Use rules-based (extract_rules.py) as fallback
 
 2. **Re-import Issues**: Cannot re-import if FKs exist
    - Need upsert re-import (not yet implemented)
@@ -451,7 +451,7 @@ Current focus:
 - GPU embedding for large datasets (when available)
 
 Future improvements:
-- LLM-based extraction (when Verda subscription is available)
+- LLM-based extraction (when an LLM endpoint is configured, local or hosted)
 - Better claim parsing (more types, better accuracy)
 - Incremental updates (re-import support)
 - Parallel processing for faster throughput
