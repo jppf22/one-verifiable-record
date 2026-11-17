@@ -6,6 +6,7 @@ both directions). The **comparison set** of page X is X plus its counterparts;
 every layer (alignment, verdicts, diff, re-check, suggestions, Q&A) runs on it.
 `page_links` is the only source of truth; `wikidata_qid` is never used here.
 """
+from typing import Optional
 from urllib.parse import quote
 
 from config import settings

@@ -1,8 +1,10 @@
-"""Local embedding service: OpenAI-style /v1/embeddings over multilingual-e5-large.
+"""Local embedding service: OpenAI-style /v1/embeddings over a local model.
 
-Verda's inference gateway has no embeddings endpoint, so we serve the model
-ourselves. The API server (query-time Q&A) and jobs/embed.py both call this.
-Point EMBED_BASE_URL at a GPU-hosted copy for bulk runs.
+This service is the default EMBED_BASE_URL: the API server (query-time Q&A,
+POST /api/pages/{id}/embed) and jobs/embed.py --endpoint both call it. It runs
+fully locally (CPU image by default, GPU image via the "gpu" compose profile).
+Any other OpenAI-compatible /v1/embeddings endpoint (local vLLM/Ollama or a
+hosted API key) can be used instead by pointing EMBED_BASE_URL at it.
 
 E5 needs instruction prefixes. Pass "input_type": "query" (default) or
 "passage". Inputs that already start with "query: " / "passage: " are kept as-is.
@@ -29,7 +31,7 @@ app = FastAPI(title="OVR embedder")
 
 
 def _authorize(authorization: str | None):
-    """Require a bearer token when this service is hosted off the app VM."""
+    """Require a bearer token when EMBED_API_TOKEN is set (e.g. the GPU profile)."""
     if not EMBED_API_TOKEN:
         return
     supplied = (authorization or "").removeprefix("Bearer ")

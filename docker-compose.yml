@@ -32,14 +32,25 @@ services:
       DATABASE_USER: ${MARIADB_USER:-ovr}
       DATABASE_PASSWORD: ${MARIADB_PASSWORD:-ovr_pass}
       DATABASE_NAME: ${MARIADB_DATABASE:-wikipedia}
-      VERDA_API_KEY: ${VERDA_API_KEY:-}
-      VERDA_BASE_URL: ${VERDA_BASE_URL:-https://inference.verda.com/v1}
-      LLM_MODEL: ${LLM_MODEL:-kimi-k3-1-pro}
-      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
-      EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+      # AI inference: any OpenAI-compatible /v1 endpoint, local or hosted.
+      # Local model via the ollama profile below: LLM_BASE_URL=http://ollama:11434/v1
+      # Local model on the host (vLLM/LM Studio/llama.cpp): http://host.docker.internal:...
+      # Hosted API key: e.g. https://api.openai.com/v1 or https://openrouter.ai/api/v1
+      # Leave LLM_BASE_URL/LLM_MODEL empty to run LLM-free (deterministic verdicts only).
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_EXTRA_BODY: ${LLM_EXTRA_BODY:-}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+      # Embeddings: any OpenAI-compatible /v1/embeddings endpoint.
+      # Default: the local embedder service below. Local GPU worker: the "gpu"
+      # profile (embedder-gpu) with EMBED_BASE_URL=http://embedder-gpu:8002/v1.
       EMBED_BASE_URL: ${EMBED_BASE_URL:-http://embedder:8001/v1}
-      GPU_EMBED_BASE_URL: ${GPU_EMBED_BASE_URL:-}
-      GPU_EMBED_TOKEN: ${GPU_EMBED_TOKEN:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+    extra_hosts:
+      # lets LLM_BASE_URL/EMBED_BASE_URL point at servers running on the host
+      - "host.docker.internal:host-gateway"
     depends_on:
       mariadb:
         condition: service_healthy
@@ -48,13 +59,58 @@ services:
     restart: unless-stopped
 
   embedder:
+    # Local CPU embedding service (OpenAI-compatible /v1/embeddings).
     build: ./embedder
     container_name: ovr-embedder
     environment:
       EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+      # When EMBED_API_KEY is set, the service requires it as a bearer token and
+      # the server sends it automatically.
+      EMBED_API_TOKEN: ${EMBED_API_KEY:-}
       OMP_NUM_THREADS: ${EMBED_THREADS:-3}
     ports:
       - "127.0.0.1:8001:8001"
+    restart: unless-stopped
+
+  # Optional local GPU embedding worker (replaces the embedder service as the
+  # EMBED_BASE_URL target):
+  #   EMBED_API_KEY=<token> docker compose --profile gpu up -d embedder-gpu
+  #   EMBED_BASE_URL=http://embedder-gpu:8002/v1
+  # Requires the NVIDIA container toolkit on the host.
+  embedder-gpu:
+    profiles: ["gpu"]
+    build:
+      context: ./embedder
+      dockerfile: Dockerfile.gpu
+    container_name: ovr-embedder-gpu
+    environment:
+      EMBED_MODEL: ${EMBED_MODEL:-intfloat/multilingual-e5-large}
+      EMBED_API_TOKEN: ${EMBED_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "127.0.0.1:8002:8001"
+    restart: unless-stopped
+
+  # Optional local LLM (chat completions) for all AI inference:
+  #   docker compose --profile local-llm up -d ollama
+  #   docker compose exec ollama ollama pull <model>
+  #   LLM_BASE_URL=http://ollama:11434/v1  LLM_MODEL=<model>
+  # Any other OpenAI-compatible server (vLLM, LM Studio, llama.cpp on the host,
+  # or a hosted API key) works the same through LLM_BASE_URL.
+  ollama:
+    profiles: ["local-llm"]
+    image: ollama/ollama:latest
+    container_name: ovr-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
     restart: unless-stopped
 
   web:
@@ -70,3 +126,4 @@ services:
 
 volumes:
   mariadb_data:
+  ollama_data:

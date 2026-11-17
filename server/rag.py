@@ -1,16 +1,15 @@
 """Grounded Q&A: vector retrieval over chunks + LLM synthesis with receipts.
 
-The same MariaDB vector index that powers the merge view answers reader
-questions, with per-language citations (article, revision, wiki URL).
+Restricted to the comparison set of one page (the page + its counterpart
+pages), with per-page citations (page, revision, wiki URL).
 Falls back to lexical search when the embedder service is unreachable.
 """
 import httpx
 
+import llm
 from config import settings
-from db import query
-
-MAX_RETRIEVAL_K = 20
-MAX_CONTEXT_CHARS = 24_000
+from db import placeholders, query
+from pages import comparison_set
 
 
 def _vec_literal(vec) -> str:
@@ -18,12 +17,15 @@ def _vec_literal(vec) -> str:
 
 
 def embed_question(text: str) -> str | None:
-    """Embed via the local embedder service; None means 'use the lexical fallback'."""
+    """Embed via the configured embeddings endpoint (local embedder service or
+    any OpenAI-compatible /v1/embeddings API); None = 'use the lexical fallback'."""
     if not settings.embed_base_url:
         return None
     try:
+        headers = {"Authorization": f"Bearer {settings.embed_api_key}"} if settings.embed_api_key else {}
         r = httpx.post(
-            f"{settings.embed_base_url}/embeddings",
+            f"{settings.embed_base_url.rstrip('/')}/embeddings",
+            headers=headers,
             json={"model": settings.embed_model, "input": [text], "input_type": "query"},
             timeout=30,
         )
@@ -33,94 +35,67 @@ def embed_question(text: str) -> str | None:
         return None
 
 
-def retrieve(qid: str, question: str, lang: str | None = None, k: int | None = None):
-    k = max(1, min(k or settings.top_k, MAX_RETRIEVAL_K))
+def retrieve(page_id: int, question: str, lang: str | None = None, k: int | None = None):
+    """Passages from the comparison set of page_id (the page + its counterparts)."""
+    k = k or settings.top_k
+    ids = comparison_set(page_id)
+    pages_filter = f"ch.article_id IN ({placeholders(ids)})"
     lang_filter = " AND a.lang = %s" if lang else ""
     lang_param = [lang] if lang else []
     vec = embed_question(question)
     if vec is not None:
-        # Restricted to one entity's editions (a few dozen chunks), so ranking them
+        # Restricted to one comparison set (a few dozen chunks), so ranking them
         # by exact cosine distance is cheap. Corpus-wide search would use the HNSW
         # index via the subquery shape from the MariaDB RAG starter.
         hits = query(
-            f"""SELECT ch.id, ch.text, a.lang, a.title, a.revision_id,
+            f"""SELECT ch.id, ch.article_id AS page_id, ch.text, a.lang, a.title, a.revision_id,
                        VEC_DISTANCE_COSINE(ce.embedding, VEC_FromText(%s)) AS dist
                 FROM chunks ch
                 JOIN chunk_embeddings ce ON ce.chunk_id = ch.id
                 JOIN articles a ON a.id = ch.article_id
-                WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter}
+                WHERE {pages_filter}{lang_filter}
                 ORDER BY dist ASC
                 LIMIT %s""",
-            tuple([vec, qid] + lang_param + [k]),
+            tuple([vec] + ids + lang_param + [k]),
         )
         if hits:
             return hits
-    # lexical fallback: embedder unreachable, or this entity's chunks not embedded yet
+    # lexical fallback: embedder unreachable, or these pages' chunks not embedded yet
     words = [w for w in question.split() if len(w) > 3][:6] or [question]
-    # ``%`` and ``_`` are SQL LIKE wildcards. Escape them so a reader's literal
-    # query does not accidentally turn the fallback into a corpus-wide scan.
-    def like_term(word: str) -> str:
-        return "%" + word.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
-
-    likes = " OR ".join(["ch.text LIKE %s ESCAPE '!'"] * len(words))
+    likes = " OR ".join(["ch.text LIKE %s"] * len(words))
     return query(
-        f"""SELECT ch.id, ch.text, a.lang, a.title, a.revision_id
+        f"""SELECT ch.id, ch.article_id AS page_id, ch.text, a.lang, a.title, a.revision_id
             FROM chunks ch
             JOIN articles a ON a.id = ch.article_id
-            WHERE a.wikidata_qid = %s AND ch.revision_id <=> a.revision_id{lang_filter} AND ({likes})
+            WHERE {pages_filter}{lang_filter} AND ({likes})
             LIMIT %s""",
-        tuple([qid] + lang_param + [like_term(w) for w in words] + [k]),
+        tuple(ids + lang_param + [f"%{w}%" for w in words] + [k]),
     )
 
 
 def synthesize(question: str, hits) -> str | None:
-    if not settings.verda_api_key or not hits:
+    if not llm.configured() or not hits:
         return None
-    excerpts, used = [], 0
-    for hit in hits:
-        header = f"[{hit['lang']}] {hit['title']} (rev {hit['revision_id']}):\n"
-        remaining = MAX_CONTEXT_CHARS - used - len(header)
-        if remaining <= 0:
-            break
-        text = (hit["text"] or "")[:remaining]
-        excerpts.append(header + text)
-        used += len(header) + len(text) + 2
-    context = "\n\n".join(excerpts)
+    context = "\n\n".join(
+        f"[{h['lang']}] {h['title']} (rev {h['revision_id']}):\n{h['text']}" for h in hits
+    )
     try:
-        r = httpx.post(
-            f"{settings.verda_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.verda_api_key}"},
-            json={
-                "model": settings.llm_model,
-                "temperature": 0,
-                "reasoning_effort": settings.llm_reasoning_effort,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Answer only from the provided excerpts. Cite each fact "
-                            "as [lang] inline. If the excerpts disagree across "
-                            "languages, say so explicitly and quote both sides."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Excerpts:\n{context}\n\nQuestion: {question}",
-                    },
-                ],
-            },
-            timeout=60,
+        return llm.chat_text(
+            "Answer only from the provided excerpts. Cite each fact "
+            "as [lang] inline. If the excerpts disagree across "
+            "languages, say so explicitly and quote both sides.",
+            f"Excerpts:\n{context}\n\nQuestion: {question}",
+            max_tokens=800,
         )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception:
+    except llm.LLMUnavailable:
         return None
 
 
-def answer(qid: str, question: str, lang: str | None = None) -> dict:
-    hits = retrieve(qid, question, lang)
+def answer(page_id: int, question: str, lang: str | None = None) -> dict:
+    hits = retrieve(page_id, question, lang)
     citations = [
         {
+            "page_id": h["page_id"],
             "lang": h["lang"],
             "title": h["title"],
             "revision_id": h["revision_id"],
@@ -132,9 +107,9 @@ def answer(qid: str, question: str, lang: str | None = None) -> dict:
         for h in hits
     ]
     return {
-        "qid": qid,
+        "page_id": page_id,
         "question": question,
         "answer": synthesize(question, hits)
-        or "No synthesized answer: the LLM is unavailable (check VERDA_API_KEY and the model subscription). The retrieved passages are cited below.",
+        or "No synthesized answer: the LLM is unavailable (set LLM_BASE_URL and LLM_MODEL to any OpenAI-compatible endpoint, local or hosted). The retrieved passages are cited below.",
         "citations": citations,
     }

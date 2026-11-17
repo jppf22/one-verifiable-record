@@ -15,14 +15,15 @@ This file configures Vibe CLI behavior for the One Verifiable Record project.
 
 ## Model Preferences
 - **Default Model**: Use the fastest available model for code tasks
-- **LLM Tasks**: When LLM access is needed, prefer Verda Inference API endpoints
-  - Base URL: `https://inference.verda.com/v1`
-  - Model: `kimi-k3-1-pro`
+- **LLM Tasks**: The project runs fully locally now. AI inference uses any
+  OpenAI-compatible `/v1` endpoint configured via `LLM_BASE_URL`/`LLM_API_KEY`/
+  `LLM_MODEL` (local Ollama via the `local-llm` compose profile, vLLM/LM Studio
+  on the host, or a hosted API key). See `docs/deploy-local.md`.
 
 ## Tool Permissions
 - **File System**: Full read/write access within the project directory
 - **Process**: Can start/stop docker containers, run Python scripts
-- **Network**: Can access localhost ports (8000, 8080, 3306) and Verda API
+- **Network**: Can access localhost ports (8000, 8080, 3306, 8001, 11434)
 - **Git**: Can commit, push (with confirmation), create branches
 
 ## Context Directories
@@ -54,7 +55,7 @@ This file configures Vibe CLI behavior for the One Verifiable Record project.
 - No automated Wikipedia editing (WMF policy)
 - Must use MariaDB vector + SVT features
 - Must work with datasets: small/medium/large
-- Deployable on Verda cloud (CPU VM + GPU instance)
+- Fully locally deployable via docker-compose (optional `local-llm` Ollama and `gpu` embedder profiles)
 
 ## Quick Commands
 ```bash

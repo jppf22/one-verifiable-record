@@ -140,11 +140,12 @@ AND c.ROW_START > cl.computed_at + INTERVAL 1 SECOND
    - Date comparison: coarser precision ("1900" agrees with "1900-09-03")
    - Differing numbers → pass to LLM layer
 
-2. **LLM Layer** (Verda Inference API)
+2. **LLM Layer** (any OpenAI-compatible `/v1/chat/completions` endpoint)
    - Cross-language entailment
    - Used when deterministic layer cannot decide
-   - Model: kimi-k3-1-pro
-   - Endpoint: https://inference.verda.com/v1/chat/completions
+   - Config: `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` (local model or hosted
+     API key; `OPENAI_*` aliases accepted), `LLM_EXTRA_BODY` for provider params
+   - Client with pacing/retries: `server/llm.py`
 
 ### Verdict Sources
 - `deterministic`: From deterministic layer
@@ -273,7 +274,7 @@ Exact match on (page_id, patch_type, wikitext).
 ### Q&A Flow
 1. Embed the query
 2. Search for relevant chunks in MariaDB
-3. Generate answer using LLM (Verda Inference)
+3. Generate answer using the configured LLM (server/llm.py)
 4. Include citations with revision IDs and URLs
 
 ### Chunk Retrieval
@@ -320,21 +321,23 @@ LIMIT 5
 
 ### Environment Variables
 ```python
-DATABASE_URL=mysql+pymysql://user:pass@host:port/db
-VERDA_API_KEY=your-verda-api-key
-VERDA_BASE_URL=https://inference.verda.com/v1
-WEB_BASE_URL=http://localhost:8080
+LLM_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible endpoint (local or hosted)
+LLM_API_KEY=                              # optional for local servers
+LLM_MODEL=qwen3:8b
+EMBED_BASE_URL=http://embedder:8001/v1
+EMBED_API_KEY=
+EMBED_MODEL=intfloat/multilingual-e5-large
 ```
 
-### Settings Class
+### Settings Class (server/config.py, pydantic-settings)
 ```python
-@dataclass
-class Settings:
-    database_url: str
-    verda_api_key: str
-    verda_base_url: str = "https://inference.verda.com/v1"
-    web_base_url: str = "http://localhost:8080"
-    debug: bool = True
+llm_base_url: str = ""            # LLM_BASE_URL, OPENAI_BASE_URL/OPENAI_API_BASE alias
+llm_api_key: str = ""             # LLM_API_KEY, OPENAI_API_KEY alias
+llm_model: str = ""               # LLM_MODEL, OPENAI_MODEL alias
+llm_extra_body: dict = {}         # LLM_EXTRA_BODY (JSON, merged into chat requests)
+embed_base_url: str = "http://embedder:8001/v1"
+embed_api_key: str = ""
+embed_model: str = "intfloat/multilingual-e5-large"
 ```
 
 ## Testing
@@ -390,10 +393,10 @@ class Settings:
 - Equal numbers: always `supported`
 
 ### LLM Layer
-- Currently **not available** (Verda project not subscribed)
-- Falls back to deterministic layer
-- When available: use `kimi-k3-1-pro` via Verda Inference API
-- Embeddings: use `embedder/` container (OpenAI-compatible API)
+- Optional: with no `LLM_BASE_URL`/`LLM_MODEL` configured, grading falls back to
+  the deterministic layer (never stores a guess as a model output)
+- Embeddings: use the `embedder/` container (OpenAI-compatible API) or any
+  endpoint via `EMBED_BASE_URL`
 
 ### Recheck Behavior
 - Focus links are always regraded

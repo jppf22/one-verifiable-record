@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rules-based claim extraction (cold path): extract birth/death dates from Wikipedia leads.
 
-This is a fallback extractor when LLM (Verda) is unavailable. It uses language-specific
+This is a fallback extractor when no LLM endpoint is configured. It uses language-specific
 regex patterns to extract common factual claims (birth/death dates, founding dates, etc.)
 from the first ~6,000 characters of each article.
 

@@ -10,8 +10,9 @@ salient and cross-lingually verifiable claims per page while keeping claims
      obscure single-edition narrative minutiae.
   2. MariaDB lead-chunk centrality (`VEC_DISTANCE_COSINE` vs chunk_idx=0):
      claims central to the subject's summary score higher than tangential trivia.
-  3. Verda `kimi-k3-1-pro` second-sweep salience & subject-centrality judge
-     (non-thinking JSON mode, rate-limit paced): scores encyclopedic importance
+  3. The configured LLM (LLM_BASE_URL / LLM_MODEL, any OpenAI-compatible
+     endpoint; LLM_EXTRA_BODY for provider params) second-sweep salience &
+     subject-centrality judge (rate-limit paced): scores encyclopedic importance
      (0..1), flags off-subject claims (e.g. a parent's career date on the child's
      page), and flags duplicate/redundant claims on the same page.
 
@@ -69,7 +70,8 @@ def _parse_sec(val) -> float | None:
 
 
 def paced_post(http: httpx.Client, url: str, body: dict, min_interval: float = 1.65) -> dict:
-    """Rate-limit-aware POST to Verda Inference (40 req/min shared account window)."""
+    """Rate-limit-aware POST to the configured OpenAI-compatible endpoint
+    (honours retry-after / x-ratelimit-* headers when the server sends them)."""
     global _next_slot, _blocked_until
     backoff = 2.0
     for _ in range(5):
@@ -421,10 +423,14 @@ def main():
     ap.add_argument("--min-salience", type=float, default=0.35, help="minimum salience score for unprotected claims")
     ap.add_argument("--no-llm", action="store_true", help="use MariaDB vector + quality signals only")
     ap.add_argument("--apply", action="store_true", help="persist salience_score and prune excess claims")
-    ap.add_argument("--model", default=os.environ.get("LLM_MODEL", "kimi-k3-1-pro"))
-    ap.add_argument("--base-url", default=os.environ.get("VERDA_BASE_URL", "https://inference.verda.com/v1"))
+    ap.add_argument("--model", default=os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL", ""))
+    ap.add_argument("--base-url", default=os.environ.get("LLM_BASE_URL")
+                    or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE", ""))
     args = ap.parse_args()
-    args.api_key = "" if args.no_llm else os.environ.get("VERDA_API_KEY", "")
+    args.api_key = "" if args.no_llm else (os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY", ""))
+    if not args.no_llm and (not args.base_url or not args.model):
+        sys.exit("no LLM configured: set LLM_BASE_URL and LLM_MODEL (any OpenAI-compatible /v1 "
+                 "endpoint), or pass --no-llm to use MariaDB vector + quality signals only")
 
     conn = connect()
     try:

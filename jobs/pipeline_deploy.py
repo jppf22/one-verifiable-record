@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end upgrade, ML second-sweep reranking, verification & Verda deployment.
+"""End-to-end local pipeline: upgrade, ML second-sweep reranking & verification.
 
-Uses only Python stdlib on the host and runs `jobs/*.py` inside the built
-`one-verifiable-record-server` image on the compose network so `mariadb` and
-`httpx` are guaranteed present.
+Fully local: everything runs against the docker-compose stack on this machine
+(MariaDB + API + web). Uses only Python stdlib on the host and runs `jobs/*.py`
+inside the built server image on the compose network so `mariadb` and `httpx`
+are guaranteed present. LLM/embedding calls go to whatever OpenAI-compatible
+endpoints are configured in `.env` (LLM_BASE_URL / EMBED_BASE_URL), local or
+hosted.
 """
 import glob
 import json
@@ -144,9 +147,9 @@ def run_job_in_docker(net: str, image: str, dotenv: dict, script_and_args: list[
         "-e", f"DATABASE_USER={dotenv.get('MARIADB_USER', 'ovr')}",
         "-e", f"DATABASE_PASSWORD={dotenv.get('MARIADB_PASSWORD', 'ovr_pass')}",
         "-e", f"DATABASE_NAME={dotenv.get('MARIADB_DATABASE', 'wikipedia')}",
-        "-e", f"VERDA_API_KEY={dotenv.get('VERDA_API_KEY', '')}",
-        "-e", f"VERDA_BASE_URL={dotenv.get('VERDA_BASE_URL', 'https://inference.verda.com/v1')}",
-        "-e", f"LLM_MODEL={dotenv.get('LLM_MODEL', 'kimi-k3-1-pro')}",
+        "-e", f"LLM_API_KEY={dotenv.get('LLM_API_KEY', dotenv.get('OPENAI_API_KEY', ''))}",
+        "-e", f"LLM_BASE_URL={dotenv.get('LLM_BASE_URL', dotenv.get('OPENAI_BASE_URL', ''))}",
+        "-e", f"LLM_MODEL={dotenv.get('LLM_MODEL', '')}",
         image, "python", *script_and_args,
     ]
     return sh(cmd)
@@ -218,12 +221,12 @@ def main():
         "--augment", "--rerank", "--max-claims-per-page", "8", "--concurrency", "2",
     ]), flush=True)
 
-    step("5. Embedding all new claims via ovr-embedder (multilingual-e5-large -> MariaDB VECTOR(1024))")
+    step("5. Embedding all new claims via the configured embeddings endpoint (EMBED_BASE_URL; default ovr-embedder, multilingual-e5-large -> MariaDB VECTOR(1024))")
     print(run_job_in_docker(net, srv_image, dotenv, [
         "/jobs/embed.py", "--endpoint", "http://embedder:8001/v1", "--tables", "claims",
     ]), flush=True)
 
-    step("6. Running Second-Sweep Hybrid ML + MariaDB HNSW Reranker across all LLM-extracted sets")
+    step("6. Running Second-Sweep Hybrid ML + MariaDB HNSW Reranker across all LLM-extracted sets (LLM_BASE_URL)")
     print(run_job_in_docker(net, srv_image, dotenv, [
         "/jobs/rerank_claims.py", "--all-llm", "--max-per-page", "8", "--apply",
     ]), flush=True)
@@ -263,94 +266,13 @@ def main():
     print(f"Total 'LLM error:' links across entire local DB: {err_cnt_final}", flush=True)
     assert err_cnt_final == "0", f"Expected 0 LLM error links, got {err_cnt_final}"
 
-    step("8. Ensuring demo seed votes & verifying local stack end-to-end")
+    step("8. Ensuring demo seed votes & verifying the API end-to-end")
     print(sh([sys.executable, "jobs/seed_demo_votes.py", "--apply", "--api", "http://127.0.0.1:8080/api"], check=False), flush=True)
-    verify_stack("http://127.0.0.1:8080", "Local Stack")
+    verify_stack("http://127.0.0.1:8000", "Local API")
 
-    step("9. Deploying codebase, schema migrations, and SVT-preserved MariaDB state to Verda VM (ovr / 65.108.32.138)")
-    sh(
-        "tar --exclude='.git' --exclude='.env' --exclude='__pycache__' --exclude='*.pyc' "
-        "--exclude='db/load/data' --exclude='*.png' -czf - . | "
-        "ssh -o BatchMode=yes ovr 'cd /root/one-verifiable-record && rm -rf extension/styles.css && tar -xzf -'"
-    )
-    remote_env_update = (
-        f"VERDA_API_KEY={dotenv['VERDA_API_KEY']}\n"
-        f"VERDA_BASE_URL={dotenv.get('VERDA_BASE_URL', 'https://inference.verda.com/v1')}\n"
-        f"LLM_MODEL={dotenv.get('LLM_MODEL', 'kimi-k3-1-pro')}\n"
-        "OVR_PUBLIC_BIND=0.0.0.0\n"
-    )
-    sh(
-        "ssh -o BatchMode=yes ovr 'python3 - << \"PY\"\n"
-        "import os, sys\n"
-        "p = \"/root/one-verifiable-record/.env\"\n"
-        "lines = open(p).read().splitlines() if os.path.exists(p) else []\n"
-        "updates = dict(l.split(\"=\", 1) for l in sys.stdin.read().splitlines() if \"=\" in l)\n"
-        "out, seen = [], set()\n"
-        "for l in lines:\n"
-        "    if \"=\" in l and not l.lstrip().startswith(\"#\"):\n"
-        "        k = l.split(\"=\", 1)[0].strip()\n"
-        "        if k in updates:\n"
-        "            out.append(f\"{k}={updates[k]}\")\n"
-        "            seen.add(k)\n"
-        "            continue\n"
-        "    out.append(l)\n"
-        "for k, v in updates.items():\n"
-        "    if k not in seen:\n"
-        "        out.append(f\"{k}={v}\")\n"
-        "open(p, \"w\").write(\"\\n\".join(out) + \"\\n\")\n"
-        "PY'",
-        input_text=remote_env_update,
-    )
-
-    sh(
-        "ssh -o BatchMode=yes ovr 'docker exec -i ovr-mariadb sh -lc "
-        "\"mariadb -u\\\"$MARIADB_USER\\\" -p\\\"$MARIADB_PASSWORD\\\" \\\"$MARIADB_DATABASE\\\"\"'",
-        input_text=IDEMPOTENT_SCHEMA_SQL,
-    )
-
-    local_sig = sh(
-        ["docker", "exec", "-i", "ovr-mariadb", "mariadb", "-N",
-         f"-u{db_user}", f"-p{db_pass}", db_name,
-         "-e", "SELECT COUNT(*), MIN(id), MAX(id) FROM articles; SELECT COUNT(*), MIN(id), MAX(id) FROM chunks; "
-               "SELECT id, lang, page_id FROM articles WHERE id IN (1, 100, 4518, 11355, 13750) ORDER BY id;"]
-    ).strip()
-    remote_sig = sh(
-        "ssh -o BatchMode=yes ovr 'docker exec -i ovr-mariadb sh -lc "
-        "\"mariadb -N -u\\\"$MARIADB_USER\\\" -p\\\"$MARIADB_PASSWORD\\\" \\\"$MARIADB_DATABASE\\\" -e "
-        "\\\"SELECT COUNT(*), MIN(id), MAX(id) FROM articles; SELECT COUNT(*), MIN(id), MAX(id) FROM chunks; "
-        "SELECT id, lang, page_id FROM articles WHERE id IN (1, 100, 4518, 11355, 13750) ORDER BY id;\\\"\"'"
-    ).strip()
-    if local_sig == remote_sig:
-        print("  Article & chunk IDs match 1:1 — streaming SVT-enabled claims, embeddings, links, reviews & resolutions to ovr...", flush=True)
-        sh(
-            f"docker exec ovr-mariadb mariadb-dump -u{db_user} -p{db_pass} "
-            f"--single-transaction --add-drop-table {db_name} "
-            "claims claim_embeddings claim_links reviews resolutions suggestions | gzip -c | "
-            "ssh -o BatchMode=yes ovr 'gunzip -c | docker exec -i ovr-mariadb sh -lc "
-            "\"(echo \\\"SET FOREIGN_KEY_CHECKS=0;\\\"; cat; echo \\\"SET FOREIGN_KEY_CHECKS=1;\\\") | "
-            "mariadb -u\\\"$MARIADB_USER\\\" -p\\\"$MARIADB_PASSWORD\\\" \\\"$MARIADB_DATABASE\\\"\"'"
-        )
-    else:
-        raise RuntimeError(f"Article/chunk signature mismatch:\nLOCAL:\n{local_sig}\nREMOTE:\n{remote_sig}")
-
-    print(sh("ssh -o BatchMode=yes ovr 'cd /root/one-verifiable-record && docker compose up -d --build server web && (ufw status 2>/dev/null | grep -q \"Status: active\" && ufw allow 8080/tcp || true)'"), flush=True)
-    # Verify inside ovr first, then test external public IP 65.108.32.138:8080
-    sh("ssh -o BatchMode=yes ovr 'python3 - << \"PY\"\n"
-       "import json, urllib.request\n"
-       "conf = json.loads(urllib.request.urlopen(\"http://127.0.0.1:8080/api/pages/conflicted?limit=10\", timeout=30).read())\n"
-       "assert conf, \"empty conflicted list\"\n"
-       "for it in conf[:8]:\n"
-       "    pid = it[\"page\"][\"id\"]\n"
-       "    c = json.loads(urllib.request.urlopen(f\"http://127.0.0.1:8080/api/pages/{pid}/compare\", timeout=30).read())[\"summary\"]\n"
-       "    assert (it[\"conflicts\"], it[\"missing_here\"], it[\"only_here\"], it[\"agree\"]) == (c[\"conflict\"], c[\"missing_here\"], c[\"only_here\"], c[\"agree\"])\n"
-       "print(\"Remote internal 8/8 pages verified 100% consistent!\")\n"
-       "PY'")
-    try:
-        wait_health("http://65.108.32.138:8080", timeout_s=15.0)
-        verify_stack("http://65.108.32.138:8080", "Remote Verda Public IP (http://65.108.32.138:8080)")
-    except Exception as exc:
-        print(f"  Note: external check on 65.108.32.138:8080 returned ({exc}); remote internal 0.0.0.0:8080 is verified live.", flush=True)
-    print("\nALL DONE: Local and Verda Cloud deployments are live, consistent, reranked, and verified!", flush=True)
+    step("9. Final end-to-end verification through the web origin (/api proxy)")
+    verify_stack("http://127.0.0.1:8080", "Local Stack (web origin)")
+    print("\nALL DONE: the local stack is live, consistent, reranked, and verified!", flush=True)
 
 
 if __name__ == "__main__":

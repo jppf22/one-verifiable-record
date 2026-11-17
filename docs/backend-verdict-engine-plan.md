@@ -18,7 +18,7 @@ changes additive and backwards compatible with the existing API.
 ## Tasks
 
 ### 1. LLM fallback marking (`verdict_source='deterministic-fallback'`)
-Problem today: when `VERDA_API_KEY` is unset, `llm_verdict` silently returns a
+Problem today: when no LLM endpoint is configured (`LLM_BASE_URL`/`LLM_MODEL` unset), `llm_verdict` silently returns a
 `possible_match`/`unknown` labelled `verdict_source='llm'`, which misrepresents
 a guess as a model output. Fix:
 - Add enum value `deterministic-fallback` to `claim_links.verdict_source`

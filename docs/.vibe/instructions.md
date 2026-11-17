@@ -46,9 +46,9 @@ This directory contains the living documentation for the project. All agents sho
    - Roadmap items
    - Technical considerations
 
-7. **deploy-verda.md** - Deployment guide
-   - Verda cloud setup
-   - Docker compose configuration
+7. **deploy-local.md** - Local deployment guide
+   - Fully local docker-compose setup
+   - Local LLM (Ollama profile) or hosted API keys
    - Deployment steps
 
 ## How to Use These Docs
@@ -93,7 +93,7 @@ This directory contains the living documentation for the project. All agents sho
 - Claim extraction: LLM (when available) + rules fallback
 
 ### Blockers & Issues
-- Verda project not subscribed to LLM models (using rules-based extraction)
+- No LLM endpoint configured by default (LLM_BASE_URL/LLM_MODEL in .env; rules-based extraction works LLM-free)
 - Re-import with changed revisions not yet implemented
 - Human review override not yet implemented (re-check only)
 

@@ -4,7 +4,8 @@ Once policy R1 has confirmed a conflict (claim_links.verdict = 'contradicted',
 verdict_source = 'human', see consensus.py), a reviewer writes the correct version
 once, in English, with a reliable source. The server then drafts the fix for every
 page of the comparison set (fi / sv / en): the English text as written, other
-languages machine-translated through the Verda Inference API. Each draft is a
+languages machine-translated through the configured LLM (any OpenAI-compatible
+endpoint). Each draft is a
 `suggestions` row (resolution_id set) that a human copies into Wikipedia's editor.
 
 Nothing is ever submitted to Wikipedia (cross-wiki automated editing is
@@ -12,13 +13,10 @@ prohibited). Another Wikipedia is not a source (WP:CIRCULAR), so source URLs on
 wikipedia.org / wikidata.org are rejected. `resolutions` is SYSTEM VERSIONED.
 """
 import datetime
-import json
 from urllib.parse import urlparse
 
-import httpx
-
 import consensus
-from config import settings
+import llm
 from db import insert, placeholders, query, query_one
 from diff import build_comparison
 from pages import lang_key
@@ -60,32 +58,21 @@ def translate(text: str, lang: str) -> tuple[str, bool]:
     is unavailable the English text comes back with translated=False."""
     if lang == "en":
         return text, True
-    if not settings.verda_api_key:
+    if not llm.configured():
         return text, False
     name = LANG_NAMES.get(lang, lang)
     try:
-        r = httpx.post(
-            f"{settings.verda_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.verda_api_key}"},
-            json={
-                "model": settings.llm_model,
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": (
-                        f"Translate one corrected encyclopedic statement from English into "
-                        f"{name} for {lang}.wikipedia.org. Keep every name, number and date "
-                        f"exactly; write dates the way {name} Wikipedia does. Do not add "
-                        'facts. Reply ONLY with JSON: {"text": "..."}')},
-                    {"role": "user", "content": text},
-                ],
-            },
-            timeout=45,
+        data = llm.chat_json(
+            f"Translate one corrected encyclopedic statement from English into "
+            f"{name} for {lang}.wikipedia.org. Keep every name, number and date "
+            f"exactly; write dates the way {name} Wikipedia does. Do not add "
+            'facts. Reply ONLY with JSON: {"text": "..."}',
+            text,
+            max_tokens=600,
         )
-        r.raise_for_status()
-        out = str(json.loads(r.json()["choices"][0]["message"]["content"]).get("text") or "").strip()
+        out = str(data.get("text") or "").strip()
         return (out, True) if out else (text, False)
-    except Exception:  # degrade to the English text, flagged for a human translator
+    except llm.LLMUnavailable:  # degrade to the English text, flagged for a human translator
         return text, False
 
 

@@ -34,22 +34,41 @@ the owner go under "Open questions". Agents add entries here as they make calls.
 - A5. The old `/?qid=Q…` link (used by the extension) keeps working and redirects to
   `#/merge/Q…`.
 
+## Local-only deployment (user-confirmed, post-hackathon)
+- L1. The project no longer relies on anything provided by Verda (CPU VM, GPU
+  instance, Inference API). The whole stack runs locally via docker-compose; the
+  runbook is `docs/deploy-local.md`.
+- L2. AI inference is provider-agnostic: any OpenAI-compatible `/v1` chat endpoint,
+  local model or hosted API key. Config: `LLM_BASE_URL` / `LLM_API_KEY` /
+  `LLM_MODEL` (`OPENAI_BASE_URL`/`OPENAI_API_BASE`/`OPENAI_API_KEY` accepted as
+  aliases), `LLM_EXTRA_BODY` (JSON merged into every chat request for
+  provider-specific params), `LLM_REASONING_EFFORT` sent only when non-empty.
+  Local Ollama ships as the `local-llm` compose profile; vLLM/LM Studio/llama.cpp
+  on the host work via `http://host.docker.internal:...`.
+- L3. Embeddings use any OpenAI-compatible `/v1/embeddings` endpoint:
+  `EMBED_BASE_URL` / `EMBED_API_KEY` / `EMBED_MODEL`. Default is the local
+  `embedder` container (CPU); the `gpu` compose profile runs it on a local GPU.
+  Embedding dimensions must match `VECTOR(1024)` in `db/schema.sql`.
+- L4. With no LLM endpoint configured the app still runs LLM-free: verdicts use
+  the deterministic layer only, RAG returns cited passages without a synthesized
+  answer, and `jobs/extract_rules.py` extracts claims without an LLM.
+
 ## Deployment & data pipeline (2026-11-14)
 User-confirmed:
 - D1. Embeddings live in separate tables `chunk_embeddings` / `claim_embeddings`
   (NOT NULL, HNSW `DISTANCE=cosine`, not versioned). MariaDB vector indexes need NOT
   NULL columns, and writing an embedding must not create a new `claims` version.
-- D2. Claims are extracted with the **LLM (Verda, Kimi K3.1 Pro)**: a pilot of ~20
+- D2. Claims are extracted with the **configured LLM** (see L2): a pilot of ~20
   best-covered tri-lingual topics first, reviewed with the owner, then all 2,919
   tri-lingual topics in the background.
-- D3. The owner asked for a **GPU instance** for bulk embedding (pending: needs Verda
-  cloud credentials or CLI access).
+- D3. Bulk embedding runs on a **GPU** when available — locally via the `gpu`
+  compose profile (see L3); CPU is fine for small/medium datasets.
 
 Assumed (coordinator):
-- D4. Verda Inference is `https://inference.verda.com/v1`, model id `kimi-k3-1-pro`. The
-  old `api.verda.com` URL and `kimi-k3.1-pro` id were wrong. The gateway has **no
-  `/v1/embeddings`**, so e5-large is served by our own `embedder` container
-  (OpenAI-style API). Q&A query embedding and `jobs/embed.py --endpoint` use it.
+- D4. (Superseded by L2/L3.) During the hackathon, chat inference used the Verda
+  Inference API; embeddings are served by our own `embedder` container
+  (OpenAI-style API), which Q&A query embedding and `jobs/embed.py --endpoint`
+  also use.
 - D5. Extraction sends **every current source chunk**. Requests are batched at roughly
   6,000 characters to respect the model context window, but batching never selects a
   lead section or a preset group of properties. `--max-claims 0` is the default (no
