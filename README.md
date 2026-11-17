@@ -51,6 +51,21 @@ See `docs/deploy-local.md` for the full local deployment runbook.
 
 ## Quick start
 
+Fast path via the root Makefile (`make help` lists everything; full runbook in
+`docs/deploy-local.md`):
+
+```bash
+make up-llm                 # .env + core stack + local Ollama  (or plain `make up`, LLM-free)
+# set LLM_BASE_URL=http://ollama:11434/v1 and LLM_MODEL=qwen3:8b in .env, then:
+docker compose exec ollama ollama pull qwen3:8b
+make data-small import      # download + import the small dataset
+make pipeline               # embed chunks -> extract claims (LLM) -> embed claims
+make align PAGE=<id>        # alignment + verdicts for one page (find ids via /api/pages?q=...)
+# open http://localhost:8080
+```
+
+Step by step with raw commands:
+
 ```bash
 cp .env.example .env          # MariaDB credentials + AI endpoints (all optional, see below)
 docker compose up --build -d  # MariaDB + API + web + local embedder

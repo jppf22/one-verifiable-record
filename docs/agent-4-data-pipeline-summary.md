@@ -82,7 +82,7 @@ Agent 4 focused on improving the **Data Pipeline Robustness** direction, address
 
 ### 4. Implemented Rules-Based Claim Extraction (V2 Fallback) ✅
 
-**Problem**: LLM (Verda) was unavailable for the demo, requiring a fallback extraction method.
+**Problem**: the configured LLM was unavailable for the demo, requiring a fallback extraction method.
 
 **Solution**:
 - Implemented `jobs/extract_rules.py` with comprehensive date extraction:
