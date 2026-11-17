@@ -35,9 +35,8 @@ the owner go under "Open questions". Agents add entries here as they make calls.
   `#/merge/Q…`.
 
 ## Local-only deployment (user-confirmed, post-hackathon)
-- L1. The project no longer relies on anything provided by Verda (CPU VM, GPU
-  instance, Inference API). The whole stack runs locally via docker-compose; the
-  runbook is `docs/deploy-local.md`.
+- L1. The project runs fully locally via docker-compose and relies on no external
+  hosting or inference provider. The runbook is `docs/deploy-local.md`.
 - L2. AI inference is provider-agnostic: any OpenAI-compatible `/v1` chat endpoint,
   local model or hosted API key. Config: `LLM_BASE_URL` / `LLM_API_KEY` /
   `LLM_MODEL` (`OPENAI_BASE_URL`/`OPENAI_API_BASE`/`OPENAI_API_KEY` accepted as
@@ -65,8 +64,8 @@ User-confirmed:
   compose profile (see L3); CPU is fine for small/medium datasets.
 
 Assumed (coordinator):
-- D4. (Superseded by L2/L3.) During the hackathon, chat inference used the Verda
-  Inference API; embeddings are served by our own `embedder` container
+- D4. (Superseded by L2/L3.) Chat inference uses whatever `LLM_BASE_URL` points at
+  (local model or hosted API); embeddings are served by our own `embedder` container
   (OpenAI-style API), which Q&A query embedding and `jobs/embed.py --endpoint`
   also use.
 - D5. Extraction sends **every current source chunk**. Requests are batched at roughly
@@ -184,3 +183,8 @@ Assumed (coordinator):
   claim rows in place (a tighter System-Versioned Tables story), or retain the current
   append-only claim rows per source revision? Today we choose append-only claims because
   it never compromises the source chunk that a historic claim references.
+
+Post-hackathon status: **Q1–Q3 are explicitly deferred** for the local-only deployment —
+none of them block running locally. They only matter again if the project is published
+or re-demoed against live Wikipedia; until then the current behavior stands (re-check
+only, DB snapshot, append-only claims).

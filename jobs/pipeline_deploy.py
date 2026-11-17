@@ -19,68 +19,21 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-IDEMPOTENT_SCHEMA_SQL = """
-USE wikipedia;
-SET @@system_versioning_alter_history = KEEP;
 
-ALTER TABLE page_links
-  MODIFY source VARCHAR(32) NOT NULL DEFAULT 'wikidata_sitelink',
-  ADD COLUMN IF NOT EXISTS confidence FLOAT NOT NULL DEFAULT 1.0 AFTER source,
-  ADD COLUMN IF NOT EXISTS evidence JSON NULL AFTER confidence,
-  ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER evidence;
+def apply_migrations(db_user: str, db_pass: str, db_name: str) -> None:
+    """Apply db/migrations/*.sql in order to the local MariaDB.
 
-ALTER TABLE claims
-  ADD COLUMN IF NOT EXISTS subject_entity VARCHAR(32) NULL AFTER subject,
-  ADD COLUMN IF NOT EXISTS predicate_entity VARCHAR(32) NULL AFTER predicate,
-  ADD COLUMN IF NOT EXISTS object_entity VARCHAR(32) NULL AFTER predicate_entity,
-  ADD COLUMN IF NOT EXISTS value_canonical JSON NULL AFTER value_normalized,
-  ADD COLUMN IF NOT EXISTS qualifiers JSON NULL AFTER value_canonical,
-  ADD COLUMN IF NOT EXISTS context_text MEDIUMTEXT NULL AFTER statement_text,
-  ADD COLUMN IF NOT EXISTS citation_urls JSON NULL AFTER context_text,
-  ADD COLUMN IF NOT EXISTS extraction_confidence FLOAT NULL AFTER citation_urls,
-  ADD COLUMN IF NOT EXISTS data_quality_score FLOAT NULL AFTER extraction_confidence,
-  ADD COLUMN IF NOT EXISTS salience_score FLOAT NULL AFTER data_quality_score,
-  ADD INDEX IF NOT EXISTS idx_claims_predicate (predicate),
-  ADD INDEX IF NOT EXISTS idx_claims_predicate_entity (predicate_entity);
-
-ALTER TABLE claim_embeddings
-  ADD COLUMN IF NOT EXISTS embedding_quality FLOAT NULL;
-
-ALTER TABLE chunk_embeddings
-  ADD COLUMN IF NOT EXISTS embedding_quality FLOAT NULL;
-
-ALTER TABLE claim_links
-  ADD COLUMN IF NOT EXISTS relation ENUM('same','related','different','unknown') NOT NULL DEFAULT 'unknown' AFTER similarity,
-  ADD COLUMN IF NOT EXISTS candidate_confidence FLOAT NULL AFTER relation,
-  ADD COLUMN IF NOT EXISTS verdict_confidence FLOAT NULL AFTER candidate_confidence;
-
-ALTER TABLE claim_links MODIFY verdict
-  ENUM('supported','contradicted','possible_match','possible_conflict',
-       'unverifiable','definition_mismatch','unmatched','different_fact') NOT NULL;
-
-ALTER TABLE claim_links MODIFY verdict_source
-  ENUM('deterministic','llm','human','deterministic-fallback') NOT NULL;
-
-CREATE TABLE IF NOT EXISTS resolutions (
-  id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  claim_link_id BIGINT UNSIGNED NOT NULL,
-  author        VARCHAR(128) NOT NULL,
-  correct_text  TEXT NOT NULL,
-  source_url    VARCHAR(2048) NULL,
-  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  KEY idx_res_link (claim_link_id),
-  CONSTRAINT fk_res_link FOREIGN KEY (claim_link_id) REFERENCES claim_links (id)
-) ENGINE=InnoDB WITH SYSTEM VERSIONING;
-
-ALTER TABLE suggestions
-  ADD COLUMN IF NOT EXISTS resolution_id BIGINT UNSIGNED NULL AFTER claim_link_id,
-  ADD INDEX IF NOT EXISTS idx_sugg_resolution (resolution_id);
-
-UPDATE claim_links
-   SET verdict_source = 'deterministic-fallback'
- WHERE verdict_source = 'llm'
-   AND (rationale LIKE 'LLM error:%' OR rationale LIKE 'no LLM configured%');
-"""
+    The migration files are the canonical, additive+idempotent schema upgrades
+    (db/schema.sql covers fresh databases at first boot via compose); this loop
+    upgrades an existing database. They intentionally replace the former inline
+    SQL blob so there is exactly one place where the schema evolves.
+    """
+    for path in sorted(glob.glob(os.path.join(ROOT, "db", "migrations", "*.sql"))):
+        with open(path) as f:
+            sql = f.read()
+        print(f"  applying {os.path.relpath(path, ROOT)}", flush=True)
+        sh(["docker", "exec", "-i", "ovr-mariadb", "mariadb",
+            f"-u{db_user}", f"-p{db_pass}", db_name], input_text=sql)
 
 
 def load_env(path: str) -> dict:
@@ -194,10 +147,9 @@ def main():
     db_pass = dotenv.get("MARIADB_PASSWORD", "ovr_pass")
     db_name = dotenv.get("MARIADB_DATABASE", "wikipedia")
 
-    step("1. Stopping hung legacy ovr-extract & applying idempotent schema migrations locally")
+    step("1. Stopping hung legacy ovr-extract & applying schema migrations (db/migrations/*.sql) locally")
     sh("docker rm -f ovr-extract 2>/dev/null || true", check=False)
-    sh(["docker", "exec", "-i", "ovr-mariadb", "mariadb", f"-u{db_user}", f"-p{db_pass}", db_name],
-       input_text=IDEMPOTENT_SCHEMA_SQL)
+    apply_migrations(db_user, db_pass, db_name)
 
     step("2. Rebuilding local server & web containers")
     print(sh(["docker", "compose", "up", "-d", "--build", "server", "web"]), end="", flush=True)

@@ -38,9 +38,7 @@ deterministic (dates/numbers on value_normalized) then LLM entailment.
 
 Effective/creative use of MariaDB RAG+SVT (20%), implementation/scalability
 across datasets (20%), real-world usefulness (20%), design/demo (20%),
-originality (20%); bonus for SVT or combined tracks. (The hackathon's Verda
-"Best use of Verda" bounty applied while the project was hosted on Verda; the
-project now runs fully locally.)
+originality (20%); bonus for SVT or combined tracks.
 
 ## 48h build order
 

@@ -65,7 +65,7 @@ target), `server/diff.py`, `server/main.py`, `server/patches.py`, `web/js/resolv
 `db/migrations/004_resolutions.sql` (applied), `db/schema.sql`.
 
 ### Antigravity (session c425fdc3), started 2026-11-14 19:32 CET
-Goal: Owner request — ML second-sweep claim salience reranking/pruning across pages, exact landing↔compare count consistency, zero LLM 429 errors globally, enrich top dashboard pages with dynamic ML claims (preserving all existing reviews/seeds/resolutions), and deploy end-to-end (local stack + remote Verda VM `ovr`).
+Goal: Owner request — ML second-sweep claim salience reranking/pruning across pages, exact landing↔compare count consistency, zero LLM 429 errors globally, enrich top dashboard pages with dynamic ML claims (preserving all existing reviews/seeds/resolutions), and deploy end-to-end on the local stack.
 - New files: `db/migrations/007_claim_salience.sql`, `jobs/rerank_claims.py`, `jobs/pipeline_deploy.py`.
 - Targeted edits: `db/schema.sql` (`salience_score`), `jobs/extract_claims.py` (disable reasoning tokens, rate-limit pacing, second-sweep salience reranker, review-safe `--augment` + `--top-conflicted`), `server/llm.py` (persistent HTTP client + fence stripping), `server/config.py`, `server/alignment.py` (FK-safe `clean_invalid_links` + tight semantic fallback for `gate.py`), `server/pages.py` (exact bulk `diff.build_rows` counts for `/pages/conflicted`), `server/recheck.py` (auto-heal unreviewed fallback/error links), `server/regate.py` (`--all` sweep).
 - Preserves all `reviews`, demo seed votes, `resolutions`, and `suggestions`.
